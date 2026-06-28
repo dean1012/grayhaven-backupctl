@@ -16,7 +16,7 @@ Install the operating system packages needed by the utility and test suite.
 paths through the system SELinux bindings:
 
 ```bash
-sudo dnf install git nodejs npm python3 python3-libselinux python3-pip
+sudo dnf install git python3 python3-libselinux python3-pip
 ```
 
 Create and activate a Python 3.12 or newer virtual environment with access to
@@ -33,7 +33,6 @@ Install runtime and development dependencies:
 python3 -m pip install --upgrade pip
 python3 -m pip install -r requirements.txt
 python3 -m pip install -r requirements-dev.txt
-npm install --global markdownlint-cli2
 ```
 
 [Back to top](#contributing)
@@ -44,15 +43,15 @@ Run the same validation commands used by CI:
 
 ```bash
 python3 -m pip_audit --progress-spinner off -r requirements.txt
-python3 -m py_compile grayhaven-backupctl tests/test_grayhaven_backupctl.py
+python3 -m py_compile grayhaven-backupctl
 python3 -m coverage run -m unittest discover -s tests -v
 python3 -m coverage report
 python3 -m coverage xml
 mypy --strict grayhaven-backupctl
 ruff check grayhaven-backupctl tests
 ruff format --check grayhaven-backupctl tests
-yamllint .
-markdownlint-cli2 "**/*.md"
+git ls-files '*.yml' '*.yaml' | xargs -r yamllint
+git ls-files '*.md' | xargs -r markdownlint-cli2
 ```
 
 The coverage report measures application code and fails if coverage falls below
