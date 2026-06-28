@@ -1,0 +1,1110 @@
+#!/usr/bin/env python3
+"""Operator-friendly wrapper for Grayhaven restic backups."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import dataclasses
+import fnmatch
+import getpass
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from collections.abc import Iterable, Sequence
+from datetime import UTC, datetime
+from typing import Any, cast
+
+import parsedatetime  # type: ignore[import-untyped]
+import selinux  # type: ignore[import-untyped]
+
+# ---------------------------------------------------------------------------
+# Configuration constants
+# ---------------------------------------------------------------------------
+
+BACKUP_SCRIPT = pathlib.Path("/usr/local/sbin/grayhaven-restic-backup")
+DEFAULT_CONFIG_PATH = pathlib.Path("/usr/local/sbin/grayhaven-restic-backup")
+MIN_SNAPSHOT_PREFIX = 8
+
+
+# ---------------------------------------------------------------------------
+# User-facing errors
+# ---------------------------------------------------------------------------
+
+
+class GrayhavenBackupctlError(Exception):
+    """User-facing grayhaven-backupctl failure."""
+
+
+# ---------------------------------------------------------------------------
+# Backup data models
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class BackupConfig:
+    """Restic settings derived from the authoritative backup script."""
+
+    local_repository: str
+    remote_enabled: bool
+    remote_repository: str | None
+    password_file: str
+    include_file: str
+    exclude_file: str
+    keep_daily: int
+    restic_cache_dir: str
+    gcs_credentials_file: str | None
+    gcs_project_id: str | None
+
+    @classmethod
+    def from_backup_script(
+        cls, path: pathlib.Path = DEFAULT_CONFIG_PATH
+    ) -> BackupConfig:
+        values: dict[str, str] = {}
+        pattern = re.compile(r"^([A-Z0-9_]+)=(.*)$")
+
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            raise GrayhavenBackupctlError(
+                f"Unable to read backup configuration from {path}: {exc}"
+            ) from exc
+
+        for line in lines:
+            match = pattern.match(line.strip())
+            if not match:
+                continue
+            key, raw_value = match.groups()
+            values[key] = raw_value.strip().strip('"').strip("'")
+
+        required = [
+            "LOCAL_REPOSITORY",
+            "PASSWORD_FILE",
+            "INCLUDE_FILE",
+            "EXCLUDE_FILE",
+            "KEEP_DAILY",
+            "RESTIC_CACHE_DIR",
+        ]
+        missing = [key for key in required if not values.get(key)]
+        if missing:
+            missing_values = ", ".join(missing)
+            raise GrayhavenBackupctlError(
+                f"Backup configuration is missing required value(s): {missing_values}"
+            )
+
+        return cls(
+            local_repository=values["LOCAL_REPOSITORY"],
+            remote_enabled=values.get("REMOTE_ENABLED", "false").lower() == "true",
+            remote_repository=values.get("REMOTE_REPOSITORY") or None,
+            password_file=values["PASSWORD_FILE"],
+            include_file=values["INCLUDE_FILE"],
+            exclude_file=values["EXCLUDE_FILE"],
+            keep_daily=int(values["KEEP_DAILY"]),
+            restic_cache_dir=values["RESTIC_CACHE_DIR"],
+            gcs_credentials_file=values.get("GCS_CREDENTIALS_FILE") or None,
+            gcs_project_id=values.get("GCS_PROJECT_ID") or None,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class Repository:
+    """A configured restic repository."""
+
+    name: str
+    location: str
+    config: BackupConfig
+
+    @property
+    def env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env["RESTIC_CACHE_DIR"] = self.config.restic_cache_dir
+        if self.name == "remote":
+            if self.config.gcs_project_id:
+                env["GOOGLE_PROJECT_ID"] = self.config.gcs_project_id
+            if self.config.gcs_credentials_file:
+                env["GOOGLE_APPLICATION_CREDENTIALS"] = self.config.gcs_credentials_file
+        return env
+
+
+@dataclasses.dataclass(frozen=True)
+class Snapshot:
+    """Restic snapshot metadata used by operator commands."""
+
+    repo: str
+    short_id: str
+    id: str
+    time: datetime
+    host: str
+    paths: tuple[str, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class PathMatch:
+    """A snapshot containing a requested path or pattern."""
+
+    repo: Repository
+    snapshot: Snapshot
+    requested_path: str
+    matched_path: str
+
+
+@dataclasses.dataclass(frozen=True)
+class RestoreItem:
+    """A planned restore action."""
+
+    repo: Repository
+    snapshot: Snapshot
+    requested_path: str
+    source_path: str
+    destination_path: pathlib.Path
+
+
+# ---------------------------------------------------------------------------
+# Command execution and logging
+# ---------------------------------------------------------------------------
+
+
+class CommandRunner:
+    """Small wrapper around subprocess for easier testing."""
+
+    def run(
+        self,
+        argv: list[str],
+        *,
+        env: dict[str, str] | None = None,
+        check: bool = True,
+        capture: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(  # noqa: S603
+            argv,
+            env=env,
+            check=check,
+            text=True,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.PIPE if capture else None,
+        )
+
+
+class JournalLogger:
+    """Write concise operator actions to journald through logger(1)."""
+
+    def __init__(self, runner: CommandRunner) -> None:
+        self.runner = runner
+
+    def log(self, message: str) -> None:
+        user = os.environ.get("SUDO_USER") or getpass.getuser()
+        full_message = f'user="{user}" cwd="{os.getcwd()}" {message}'
+        with contextlib.suppress(OSError):
+            self.runner.run(
+                ["logger", "--tag", "grayhaven-backupctl", "--", full_message],
+                check=False,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Backup operations
+# ---------------------------------------------------------------------------
+
+
+class BackupService:
+    """Business logic for grayhaven-backupctl commands."""
+
+    def __init__(
+        self, config: BackupConfig, runner: CommandRunner | None = None
+    ) -> None:
+        self.config = config
+        self.runner = runner or CommandRunner()
+        self.journal = JournalLogger(self.runner)
+
+    def repositories(self, selector: str) -> list[Repository]:
+        repos: list[Repository] = []
+        if selector in ("all", "local"):
+            repos.append(Repository("local", self.config.local_repository, self.config))
+        if (
+            selector in ("all", "remote")
+            and self.config.remote_enabled
+            and self.config.remote_repository
+        ):
+            repos.append(
+                Repository("remote", self.config.remote_repository, self.config)
+            )
+        return repos
+
+    def remote_configured(self) -> bool:
+        return self.config.remote_enabled and bool(self.config.remote_repository)
+
+    def run_restic(
+        self, repo: Repository, args: list[str], *, check: bool = True
+    ) -> str:
+        argv = [
+            "restic",
+            "--repo",
+            repo.location,
+            "--password-file",
+            self.config.password_file,
+            *args,
+        ]
+        try:
+            result = self.runner.run(argv, env=repo.env, check=check)
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or "").strip()
+            raise GrayhavenBackupctlError(
+                stderr or f"restic command failed for {repo.name}"
+            ) from exc
+        return result.stdout or ""
+
+    def snapshots(
+        self,
+        selector: str,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> list[Snapshot]:
+        records: list[tuple[Repository, dict[str, Any]]] = []
+        for repo in self.repositories(selector):
+            output = self.run_restic(repo, ["snapshots", "--json"])
+            records.extend((repo, item) for item in json.loads(output or "[]"))
+
+        prefix_lengths = unique_prefix_lengths([item["id"] for _, item in records])
+        snapshots: list[Snapshot] = []
+        for repo, item in records:
+            snap_time = parse_restic_time(item["time"])
+            if since and snap_time < since:
+                continue
+            if until and snap_time > until:
+                continue
+            snapshot_id = item["id"]
+            snapshots.append(
+                Snapshot(
+                    repo=repo.name,
+                    short_id=snapshot_id[: prefix_lengths[snapshot_id]],
+                    id=snapshot_id,
+                    time=snap_time,
+                    host=item.get("hostname", ""),
+                    paths=tuple(item.get("paths", [])),
+                )
+            )
+        return sorted(snapshots, key=lambda snap: snap.time, reverse=True)
+
+    def list_snapshot_contents(
+        self,
+        repo: Repository,
+        snapshot_id: str,
+        path: str,
+        *,
+        recursive: bool = False,
+    ) -> list[str]:
+        restic_args = ["ls", snapshot_id, "--json"]
+        if recursive:
+            restic_args.append("--recursive")
+        restic_args.append(path)
+        output = self.run_restic(repo, restic_args, check=False)
+        paths: list[str] = []
+        for line in output.splitlines():
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            item_path = item.get("path")
+            item_type = item.get("type")
+            if item_path and item_type not in ("snapshot",):
+                paths.append(item_path)
+        return paths
+
+    def find_matches(
+        self,
+        selector: str,
+        requested_paths: list[str],
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> list[PathMatch]:
+        matches: list[PathMatch] = []
+        repos_by_name = {repo.name: repo for repo in self.repositories(selector)}
+        for snapshot in self.snapshots(selector, since, until):
+            repo = repos_by_name[snapshot.repo]
+            for requested_path in requested_paths:
+                probe_path = probe_root_for_pattern(requested_path)
+                listed_paths = self.list_snapshot_contents(
+                    repo, snapshot.id, probe_path, recursive=True
+                )
+                matched_path = first_matching_path(requested_path, listed_paths)
+                if matched_path:
+                    matches.append(
+                        PathMatch(
+                            repo=repo,
+                            snapshot=snapshot,
+                            requested_path=requested_path,
+                            matched_path=matched_path,
+                        )
+                    )
+        return matches
+
+    def resolve_restore_plan(
+        self,
+        selector: str,
+        snapshot_ref: str,
+        requested_paths: list[str],
+        target_dir: pathlib.Path,
+        in_place: bool,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> list[RestoreItem]:
+        matches = self.find_matches(selector, requested_paths, since=since, until=until)
+        plan: list[RestoreItem] = []
+        for requested_path in requested_paths:
+            candidates = [
+                match
+                for match in matches
+                if match.requested_path == requested_path
+                and (
+                    snapshot_ref == "latest"
+                    or snapshot_matches(snapshot_ref, match.snapshot)
+                )
+            ]
+            if not candidates:
+                raise GrayhavenBackupctlError(
+                    f"No {selector} snapshot contains {requested_path}"
+                )
+
+            selected = sorted(
+                candidates,
+                key=lambda match: (
+                    repo_restore_priority(selector, match.repo.name),
+                    -match.snapshot.time.timestamp(),
+                ),
+            )[0]
+            destination = (
+                pathlib.Path(selected.matched_path)
+                if in_place
+                else target_dir / relative_tree(selected.matched_path)
+            )
+            plan.append(
+                RestoreItem(
+                    repo=selected.repo,
+                    snapshot=selected.snapshot,
+                    requested_path=requested_path,
+                    source_path=selected.matched_path,
+                    destination_path=destination,
+                )
+            )
+        return plan
+
+    def restore(self, plan: list[RestoreItem], force: bool, verbose: bool) -> None:
+        for item in plan:
+            timestamp = format_timestamp(item.snapshot.time)
+            print(
+                f"Restoring {item.source_path} from {item.snapshot.repo} snapshot "
+                f"[{item.snapshot.short_id}] taken at {timestamp}"
+            )
+            overwrite = force
+            if item.destination_path.exists() and not force:
+                confirm_overwrite(item.destination_path)
+                overwrite = True
+
+            with tempfile.TemporaryDirectory(
+                prefix="grayhaven-backupctl-restore-"
+            ) as temp_root:
+                temp_path = pathlib.Path(temp_root)
+                self.run_restic(
+                    item.repo,
+                    [
+                        "restore",
+                        item.snapshot.id,
+                        "--target",
+                        str(temp_path),
+                        "--path",
+                        item.source_path,
+                    ],
+                )
+                restored_source = temp_path / relative_tree(item.source_path)
+                if not restored_source.exists():
+                    raise GrayhavenBackupctlError(
+                        f"Restic did not restore expected path {item.source_path}"
+                    )
+                copy_restored_path(
+                    restored_source,
+                    item.destination_path,
+                    overwrite=overwrite,
+                    source_root=temp_path,
+                )
+            restore_message = (
+                f'action="restore" repo="{item.snapshot.repo}" '
+                f'snapshot="{item.snapshot.short_id}" source="{item.source_path}" '
+                f'destination="{item.destination_path}"'
+            )
+            self.journal.log(restore_message)
+            if verbose:
+                print(f"Repository: {item.repo.location}")
+            print(f"Restored to {item.destination_path}")
+
+    def backup(self, selector: str, verbose: bool) -> None:
+        if selector == "all":
+            print("Creating local and remote backups")
+            if not self.remote_configured():
+                warning = (
+                    "Warning: remote backups are not configured; "
+                    "remote backup will be skipped"
+                )
+                print(warning)
+            self.run_authoritative_backup(verbose)
+            self.journal.log('action="backup" repo="all"')
+            print("Backup completed")
+            return
+
+        if selector == "remote" and not self.remote_configured():
+            print("Warning: remote backups are not configured; no backup was created")
+            self.journal.log(
+                'action="backup-skip" repo="remote" reason="not-configured"'
+            )
+            return
+
+        repo = self.repositories(selector)[0]
+        print(f"Creating {repo.name} backup")
+        self.backup_repository(repo, verbose)
+        self.journal.log(f'action="backup" repo="{repo.name}"')
+        print("Backup completed")
+
+    def run_authoritative_backup(self, verbose: bool) -> None:
+        try:
+            result = self.runner.run(
+                [str(BACKUP_SCRIPT)], check=True, capture=not verbose
+            )
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or "").strip()
+            raise GrayhavenBackupctlError(stderr or "Backup script failed") from exc
+        if verbose and result.stdout:
+            print(result.stdout, end="")
+
+    def backup_repository(self, repo: Repository, verbose: bool) -> None:
+        self.run_restic(
+            repo,
+            [
+                "backup",
+                "--files-from",
+                self.config.include_file,
+                "--exclude-file",
+                self.config.exclude_file,
+                "--tag",
+                f"grayhaven-{repo.name}",
+                "--host",
+                hostname_fqdn(),
+            ],
+        )
+        self.run_restic(
+            repo, ["forget", "--keep-daily", str(self.config.keep_daily), "--prune"]
+        )
+        if verbose:
+            print(f"Repository: {repo.location}")
+
+
+# ---------------------------------------------------------------------------
+# Host and time helpers
+# ---------------------------------------------------------------------------
+
+
+def hostname_fqdn() -> str:
+    result = subprocess.run(
+        ["/usr/bin/hostname", "-f"], check=True, text=True, stdout=subprocess.PIPE
+    )
+    return result.stdout.strip()
+
+
+def parse_restic_time(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone()
+
+
+def parse_human_time(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+
+    explicit = parse_explicit_time(value)
+    if explicit is not None:
+        return explicit
+
+    calendar = parsedatetime.Calendar(version=parsedatetime.VERSION_CONTEXT_STYLE)
+    parsed_time, parse_context = calendar.parseDT(
+        value, sourceTime=datetime.now().astimezone()
+    )
+    parse_context_any = cast(Any, parse_context)
+    if not parse_context_any.hasDateOrTime:
+        raise GrayhavenBackupctlError(f"Could not parse time expression: {value}")
+    parsed_datetime = cast(datetime, parsed_time)
+    if parsed_datetime.tzinfo is None:
+        parsed_datetime = parsed_datetime.astimezone()
+    return parsed_datetime.astimezone()
+
+
+def parse_explicit_time(value: str) -> datetime | None:
+    """Parse explicit timestamps before falling back to natural language."""
+
+    timestamp = value.strip()
+    if not timestamp:
+        return None
+
+    iso_timestamp = timestamp[:-1] + "+00:00" if timestamp.endswith("Z") else timestamp
+    try:
+        parsed = datetime.fromisoformat(iso_timestamp)
+        if parsed.tzinfo is None:
+            parsed = parsed.astimezone()
+        return parsed.astimezone()
+    except ValueError:
+        pass
+
+    formats = (
+        "%Y-%m-%d %I:%M:%S %p",
+        "%Y-%m-%d %I:%M %p",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+    )
+    for timestamp_format in formats:
+        try:
+            return datetime.strptime(timestamp, timestamp_format).astimezone()
+        except ValueError:
+            continue
+    return None
+
+
+def format_timestamp(value: datetime) -> str:
+    return value.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z")
+
+
+# ---------------------------------------------------------------------------
+# Snapshot and path selection helpers
+# ---------------------------------------------------------------------------
+
+
+def unique_prefix_lengths(snapshot_ids: Iterable[str]) -> dict[str, int]:
+    ids = list(snapshot_ids)
+    lengths: dict[str, int] = {}
+    for snapshot_id in ids:
+        length = MIN_SNAPSHOT_PREFIX
+        while length < len(snapshot_id):
+            prefix = snapshot_id[:length]
+            if sum(other.startswith(prefix) for other in ids) == 1:
+                break
+            length += 1
+        lengths[snapshot_id] = length
+    return lengths
+
+
+def resolve_operator_path(path_value: str) -> str:
+    expanded = os.path.expandvars(os.path.expanduser(path_value))
+    return str(pathlib.Path(expanded).resolve(strict=False))
+
+
+def read_requested_paths(args: argparse.Namespace) -> list[str]:
+    paths = list(args.path or [])
+    if args.path_file:
+        try:
+            for line in (
+                pathlib.Path(args.path_file).read_text(encoding="utf-8").splitlines()
+            ):
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    paths.append(stripped)
+        except OSError as exc:
+            raise GrayhavenBackupctlError(
+                f"Unable to read path file {args.path_file}: {exc}"
+            ) from exc
+    if not paths:
+        raise GrayhavenBackupctlError(
+            "At least one --path or --path-file entry is required"
+        )
+    return [resolve_operator_path(path) for path in paths]
+
+
+def probe_root_for_pattern(path: str) -> str:
+    wildcard_positions = [
+        pos for pos in (path.find("*"), path.find("?"), path.find("[")) if pos != -1
+    ]
+    if not wildcard_positions:
+        return path
+    first_wildcard = min(wildcard_positions)
+    prefix = path[:first_wildcard]
+    if "/" not in prefix.rstrip("/"):
+        return "/"
+    if prefix.endswith("/"):
+        return prefix.rstrip("/") or "/"
+    return str(pathlib.PurePosixPath(prefix).parent)
+
+
+def first_matching_path(requested_path: str, listed_paths: list[str]) -> str | None:
+    if has_glob(requested_path):
+        for path in listed_paths:
+            if fnmatch.fnmatch(path, requested_path):
+                return path
+        return None
+
+    normalized = requested_path.rstrip("/") or "/"
+    for path in listed_paths:
+        if (path.rstrip("/") or "/") == normalized:
+            return path
+    if listed_paths and (listed_paths[0].rstrip("/") or "/") == normalized:
+        return listed_paths[0]
+    return None
+
+
+def has_glob(path: str) -> bool:
+    return any(char in path for char in "*?[")
+
+
+def snapshot_matches(reference: str, snapshot: Snapshot) -> bool:
+    return snapshot.id.startswith(reference) or snapshot.short_id == reference
+
+
+def repo_restore_priority(selector: str, repo_name: str) -> int:
+    if selector == "all" and repo_name == "local":
+        return 0
+    if selector == "all" and repo_name == "remote":
+        return 1
+    return 0
+
+
+def relative_tree(path: str) -> pathlib.Path:
+    return pathlib.Path(path.lstrip("/"))
+
+
+# ---------------------------------------------------------------------------
+# Restore filesystem helpers
+# ---------------------------------------------------------------------------
+
+
+def confirm_overwrite(path: pathlib.Path) -> None:
+    print(f"Warning: restore will overwrite existing path: {path}", file=sys.stderr)
+    response = input("Type RESTORE to continue: ")
+    if response != "RESTORE":
+        raise GrayhavenBackupctlError("Restore cancelled")
+
+
+def copy_restored_path(
+    source: pathlib.Path,
+    destination: pathlib.Path,
+    overwrite: bool,
+    source_root: pathlib.Path | None = None,
+) -> None:
+    if source_root is not None:
+        preserve_restored_ancestor_metadata(source_root, source, destination)
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() and overwrite:
+        if destination.is_dir() and not destination.is_symlink():
+            shutil.rmtree(destination)
+        else:
+            destination.unlink()
+
+    if source.is_dir():
+        shutil.copytree(source, destination, symlinks=True)
+    else:
+        shutil.copy2(source, destination, follow_symlinks=False)
+    apply_archive_metadata(source, destination)
+    restore_selinux_context(destination)
+
+
+def preserve_restored_ancestor_metadata(
+    source_root: pathlib.Path,
+    source: pathlib.Path,
+    destination: pathlib.Path,
+) -> None:
+    """Recreate restored absolute-path ancestors under a non-root target tree."""
+
+    relative_source = source.relative_to(source_root)
+    destination_root = destination
+    for _ in relative_source.parts:
+        destination_root = destination_root.parent
+
+    ancestor = pathlib.Path()
+    for part in relative_source.parts[:-1]:
+        ancestor /= part
+        source_ancestor = source_root / ancestor
+        destination_ancestor = destination_root / ancestor
+        destination_ancestor.mkdir(parents=True, exist_ok=True)
+        apply_archive_metadata(source_ancestor, destination_ancestor)
+
+
+def apply_archive_metadata(source: pathlib.Path, destination: pathlib.Path) -> None:
+    """Apply metadata from restic-restored paths after Python copy operations."""
+
+    shutil.copystat(source, destination, follow_symlinks=False)
+    source_stat = source.lstat()
+    os.chown(destination, source_stat.st_uid, source_stat.st_gid, follow_symlinks=False)
+
+    if not source.is_dir() or source.is_symlink():
+        return
+
+    for source_child in source.rglob("*"):
+        destination_child = destination / source_child.relative_to(source)
+        if not destination_child.exists() and not destination_child.is_symlink():
+            continue
+        shutil.copystat(source_child, destination_child, follow_symlinks=False)
+        child_stat = source_child.lstat()
+        os.chown(
+            destination_child,
+            child_stat.st_uid,
+            child_stat.st_gid,
+            follow_symlinks=False,
+        )
+
+
+def restore_selinux_context(path: pathlib.Path) -> None:
+    """Restore SELinux labels after copying restored files into place."""
+
+    if not selinux.is_selinux_enabled():
+        return
+    try:
+        selinux.matchpathcon(os.path.abspath(path), 0)
+    except FileNotFoundError:
+        return
+    flags = (
+        selinux.SELINUX_RESTORECON_RECURSE | selinux.SELINUX_RESTORECON_IGNORE_NOENTRY
+    )
+    selinux.selinux_restorecon(os.path.abspath(path), flags)
+
+
+# ---------------------------------------------------------------------------
+# Output formatting
+# ---------------------------------------------------------------------------
+
+
+def print_snapshots(snapshots: list[Snapshot]) -> None:
+    if not snapshots:
+        print("No backups found")
+        return
+
+    rows = [
+        ("REPO", "SNAPSHOT", "TIME", "HOST", "PATHS"),
+        *[
+            (
+                snapshot.repo,
+                snapshot.short_id,
+                format_timestamp(snapshot.time),
+                snapshot.host,
+                ", ".join(snapshot.paths),
+            )
+            for snapshot in snapshots
+        ],
+    ]
+    print_table(rows)
+
+
+def print_matches(matches: list[PathMatch]) -> None:
+    if not matches:
+        print("No matching backups found")
+        return
+
+    rows = [
+        ("PATH", "REPO", "SNAPSHOT", "TIME", "MATCH"),
+        *[
+            (
+                match.requested_path,
+                match.repo.name,
+                match.snapshot.short_id,
+                format_timestamp(match.snapshot.time),
+                match.matched_path,
+            )
+            for match in matches
+        ],
+    ]
+    print_table(rows)
+
+
+def print_paths(paths: list[str]) -> None:
+    if not paths:
+        print("No paths found")
+        return
+    for path in paths:
+        print(path)
+
+
+def print_table(rows: Sequence[Sequence[str]]) -> None:
+    widths = [max(len(row[index]) for row in rows) for index in range(len(rows[0]))]
+    for row_index, row in enumerate(rows):
+        print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)))
+        if row_index == 0:
+            print("  ".join("-" * width for width in widths))
+
+
+# ---------------------------------------------------------------------------
+# Shell completion
+# ---------------------------------------------------------------------------
+
+
+def bash_completion_script() -> str:
+    """Return bash completion for operator-facing command options."""
+
+    return r"""# bash completion for grayhaven-backupctl
+_grayhaven_backupctl()
+{
+    local cur prev words cword command
+    _init_completion || return
+
+    local global_opts="--verbose --help"
+    local commands="list ls find restore backup completion"
+    local find_opts="--repo --path --path-file --since --until --help"
+    local repos="all local remote"
+    local restore_opts="--repo --path --path-file --since --until --as-of"
+    restore_opts="$restore_opts --target --in-place --force --help"
+
+    command=""
+    for word in "${words[@]:1:cword-1}"; do
+        case "$word" in
+            list|ls|find|restore|backup|completion)
+                command="$word"
+                break
+                ;;
+        esac
+    done
+
+    case "$prev" in
+        --repo)
+            COMPREPLY=( $(compgen -W "$repos" -- "$cur") )
+            return
+            ;;
+        --since|--until|--as-of)
+            return
+            ;;
+        --path|--path-file|--target)
+            _filedir
+            return
+            ;;
+    esac
+
+    if [[ -z "$command" ]]; then
+        COMPREPLY=( $(compgen -W "$global_opts $commands" -- "$cur") )
+        return
+    fi
+
+    case "$command" in
+        list)
+            COMPREPLY=( $(compgen -W "--repo --since --until --help" -- "$cur") )
+            ;;
+        ls)
+            COMPREPLY=( $(compgen -W "--repo --path --recursive --help" -- "$cur") )
+            ;;
+        find)
+            COMPREPLY=( $(compgen -W "$find_opts" -- "$cur") )
+            ;;
+        restore)
+            COMPREPLY=( $(compgen -W "$restore_opts" -- "$cur") )
+            ;;
+        backup)
+            COMPREPLY=( $(compgen -W "--repo --help" -- "$cur") )
+            ;;
+        completion)
+            COMPREPLY=( $(compgen -W "bash --help" -- "$cur") )
+            ;;
+    esac
+}
+complete -F _grayhaven_backupctl grayhaven-backupctl
+"""
+
+
+# ---------------------------------------------------------------------------
+# Command-line parser
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="grayhaven-backupctl",
+        description="Manage Grayhaven local and remote restic backups.",
+    )
+    parser.add_argument(
+        "--verbose", action="store_true", help="show detailed command feedback"
+    )
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    list_parser = subparsers.add_parser("list", help="list available backups")
+    add_repo_option(list_parser)
+    add_time_options(list_parser)
+
+    ls_parser = subparsers.add_parser("ls", help="list files in a backup")
+    ls_parser.add_argument(
+        "snapshot", nargs="?", default="latest", help="snapshot ID or latest"
+    )
+    ls_parser.add_argument("--path", required=True, help="file or directory to list")
+    ls_parser.add_argument(
+        "--recursive", action="store_true", help="list directory contents recursively"
+    )
+    add_repo_option(ls_parser)
+
+    find_parser = subparsers.add_parser("find", help="find backups containing paths")
+    add_repo_option(find_parser)
+    add_path_options(find_parser)
+    add_time_options(find_parser)
+
+    restore_parser = subparsers.add_parser(
+        "restore", help="restore files or directories"
+    )
+    restore_parser.add_argument(
+        "snapshot", nargs="?", default="latest", help="snapshot ID or latest"
+    )
+    add_repo_option(restore_parser)
+    add_path_options(restore_parser)
+    add_time_options(restore_parser)
+    restore_parser.add_argument(
+        "--as-of",
+        help=(
+            "restore from the closest matching backup at or before a time "
+            'such as "3 days ago"'
+        ),
+    )
+    target_group = restore_parser.add_mutually_exclusive_group()
+    target_group.add_argument("--target", help="restore under this directory")
+    target_group.add_argument(
+        "--in-place", action="store_true", help="restore to original paths"
+    )
+    restore_parser.add_argument(
+        "--force", action="store_true", help="overwrite without prompting"
+    )
+
+    backup_parser = subparsers.add_parser("backup", help="create a new backup")
+    add_repo_option(backup_parser)
+
+    completion_parser = subparsers.add_parser(
+        "completion", help="print shell completion script"
+    )
+    completion_parser.add_argument(
+        "shell", choices=("bash",), help="shell to generate completion for"
+    )
+
+    return parser
+
+
+def add_repo_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--repo",
+        choices=("all", "local", "remote"),
+        default="all",
+        help="repository to use (default: all)",
+    )
+
+
+def add_time_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--since", help='include backups since a time such as "2 days ago"'
+    )
+    parser.add_argument(
+        "--until", help='include backups until a time such as "2026-06-27 8:00 AM"'
+    )
+
+
+def add_path_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--path", action="append", help="file, directory, or glob to process"
+    )
+    parser.add_argument("--path-file", help="file containing one path per line")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command is None:
+        parser.print_help()
+        return 0
+
+    try:
+        if args.command == "completion":
+            if args.shell == "bash":
+                print(bash_completion_script(), end="")
+            return 0
+
+        service = BackupService(BackupConfig.from_backup_script())
+        if args.command == "list":
+            print_snapshots(
+                service.snapshots(
+                    args.repo,
+                    since=parse_human_time(args.since),
+                    until=parse_human_time(args.until),
+                )
+            )
+        elif args.command == "ls":
+            requested_path = resolve_operator_path(args.path)
+            matches = service.find_matches(args.repo, [requested_path])
+            selected = next(
+                (
+                    match
+                    for match in matches
+                    if args.snapshot == "latest"
+                    or snapshot_matches(args.snapshot, match.snapshot)
+                ),
+                None,
+            )
+            if selected is None:
+                raise GrayhavenBackupctlError(
+                    f"No {args.repo} snapshot contains {requested_path}"
+                )
+            print_paths(
+                service.list_snapshot_contents(
+                    selected.repo,
+                    selected.snapshot.id,
+                    selected.matched_path,
+                    recursive=args.recursive,
+                )
+            )
+        elif args.command == "find":
+            requested_paths = read_requested_paths(args)
+            print_matches(
+                service.find_matches(
+                    args.repo,
+                    requested_paths,
+                    since=parse_human_time(args.since),
+                    until=parse_human_time(args.until),
+                )
+            )
+        elif args.command == "restore":
+            requested_paths = read_requested_paths(args)
+            target_dir = (
+                pathlib.Path.cwd()
+                if args.target is None
+                else pathlib.Path(args.target).resolve(strict=False)
+            )
+            if args.as_of and args.until:
+                raise GrayhavenBackupctlError(
+                    "--as-of and --until cannot be used together"
+                )
+            if args.as_of and args.snapshot != "latest":
+                raise GrayhavenBackupctlError(
+                    "--as-of can only be used with latest restore selection"
+                )
+            since = parse_human_time(args.since)
+            until = (
+                parse_human_time(args.as_of)
+                if args.as_of
+                else parse_human_time(args.until)
+            )
+            plan = service.resolve_restore_plan(
+                args.repo,
+                args.snapshot,
+                requested_paths,
+                target_dir,
+                args.in_place,
+                since=since,
+                until=until,
+            )
+            service.restore(plan, force=args.force, verbose=args.verbose)
+        elif args.command == "backup":
+            service.backup(args.repo, verbose=args.verbose)
+    except GrayhavenBackupctlError as exc:
+        print(f"grayhaven-backupctl: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
