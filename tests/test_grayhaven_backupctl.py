@@ -913,29 +913,36 @@ class GrayhavenBackupctlTests(unittest.TestCase):
             destination = root / "destination.txt"
             source.write_text("restored", encoding="utf-8")
 
-            with mock.patch.object(backupctl_module.os, "chown"):
-                with mock.patch.object(
+            with (
+                mock.patch.object(backupctl_module.os, "chown"),
+                mock.patch.object(
                     backupctl_module.selinux, "is_selinux_enabled", return_value=1
-                ):
-                    with mock.patch.object(
-                        backupctl_module.selinux,
-                        "matchpathcon",
-                        return_value=(0, "context"),
-                    ):
-                        with mock.patch.object(
-                            backupctl_module.selinux, "selinux_restorecon"
-                        ) as restorecon:
-                            backupctl_module.copy_restored_path(
-                                source, destination, overwrite=True
-                            )
+                ),
+                mock.patch.object(
+                    backupctl_module.selinux,
+                    "matchpathcon",
+                    return_value=(0, "context"),
+                    create=True,
+                ),
+                mock.patch.object(
+                    backupctl_module.selinux,
+                    "SELINUX_RESTORECON_RECURSE",
+                    1,
+                    create=True,
+                ),
+                mock.patch.object(
+                    backupctl_module.selinux,
+                    "SELINUX_RESTORECON_IGNORE_NOENTRY",
+                    2,
+                    create=True,
+                ),
+                mock.patch.object(
+                    backupctl_module.selinux, "selinux_restorecon", create=True
+                ) as restorecon,
+            ):
+                backupctl_module.copy_restored_path(source, destination, overwrite=True)
 
-            expected_flags = (
-                backupctl_module.selinux.SELINUX_RESTORECON_RECURSE
-                | backupctl_module.selinux.SELINUX_RESTORECON_IGNORE_NOENTRY
-            )
-            restorecon.assert_called_once_with(
-                os.path.abspath(destination), expected_flags
-            )
+            restorecon.assert_called_once_with(os.path.abspath(destination), 3)
 
     def test_copy_restored_path_skips_selinux_context_without_policy_entry(
         self,
@@ -946,21 +953,22 @@ class GrayhavenBackupctlTests(unittest.TestCase):
             destination = root / "destination.txt"
             source.write_text("restored", encoding="utf-8")
 
-            with mock.patch.object(backupctl_module.os, "chown"):
-                with mock.patch.object(
+            with (
+                mock.patch.object(backupctl_module.os, "chown"),
+                mock.patch.object(
                     backupctl_module.selinux, "is_selinux_enabled", return_value=1
-                ):
-                    with mock.patch.object(
-                        backupctl_module.selinux,
-                        "matchpathcon",
-                        side_effect=FileNotFoundError,
-                    ):
-                        with mock.patch.object(
-                            backupctl_module.selinux, "selinux_restorecon"
-                        ) as restorecon:
-                            backupctl_module.copy_restored_path(
-                                source, destination, overwrite=True
-                            )
+                ),
+                mock.patch.object(
+                    backupctl_module.selinux,
+                    "matchpathcon",
+                    side_effect=FileNotFoundError,
+                    create=True,
+                ),
+                mock.patch.object(
+                    backupctl_module.selinux, "selinux_restorecon", create=True
+                ) as restorecon,
+            ):
+                backupctl_module.copy_restored_path(source, destination, overwrite=True)
 
             restorecon.assert_not_called()
 
