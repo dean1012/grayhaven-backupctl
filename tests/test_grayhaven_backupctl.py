@@ -1054,6 +1054,82 @@ class GrayhavenBackupctlTests(unittest.TestCase):
             runner.calls,
         )
 
+    def test_backup_local_updates_restic_success_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            metrics_path = pathlib.Path(temp_dir) / "restic.prom"
+            repository_metric = (
+                "grayhaven_restic_repository_last_success_timestamp_seconds"
+            )
+            metrics_path.write_text(
+                "\n".join(
+                    [
+                        f"# HELP {repository_metric} Last restic backup by repository.",
+                        f"# TYPE {repository_metric} gauge",
+                        (
+                            f'{repository_metric}{{host="host.example.com",'
+                            'repository="remote"} 123'
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            runner = FakeRunner()
+            service = backupctl_module.BackupService(
+                self.config, runner, metrics_path=metrics_path
+            )
+
+            with (
+                mock.patch.object(
+                    backupctl_module, "hostname_fqdn", return_value="host.example.com"
+                ),
+                mock.patch.object(
+                    backupctl_module, "current_epoch_seconds", return_value=456
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                service.backup("local", verbose=False)
+
+            metrics = metrics_path.read_text(encoding="utf-8")
+
+        backup_metric = "grayhaven_restic_backup_last_success_timestamp_seconds"
+        repository_metric = "grayhaven_restic_repository_last_success_timestamp_seconds"
+        self.assertIn(
+            f'{backup_metric}{{host="host.example.com"}} 456',
+            metrics,
+        )
+        self.assertIn(
+            (f'{repository_metric}{{host="host.example.com",repository="local"}} 456'),
+            metrics,
+        )
+        self.assertIn(
+            (f'{repository_metric}{{host="host.example.com",repository="remote"}} 123'),
+            metrics,
+        )
+
+    def test_record_backup_success_skips_without_textfile_dir(self) -> None:
+        runner = FakeRunner()
+        metrics_path = pathlib.Path("/missing/grayhaven/restic.prom")
+        service = backupctl_module.BackupService(
+            self.config, runner, metrics_path=metrics_path
+        )
+
+        with mock.patch.object(
+            backupctl_module, "hostname_fqdn", return_value="host.example.com"
+        ) as hostname:
+            service.record_backup_success(["local"])
+
+        hostname.assert_not_called()
+
+    def test_restic_metric_rendering_orders_repository_labels(self) -> None:
+        metrics = backupctl_module.render_restic_success_metrics(
+            "host.example.com", 456, {"remote": 123, "local": 456}
+        )
+
+        local_index = metrics.index('repository="local"')
+        remote_index = metrics.index('repository="remote"')
+        self.assertLess(local_index, remote_index)
+
     def test_authoritative_backup_reports_failures_and_verbose_output(self) -> None:
         runner = mock.Mock(spec=backupctl_module.CommandRunner)
         runner.run.return_value = mock.Mock(stdout="backup output\n")

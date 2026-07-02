@@ -29,7 +29,14 @@ import selinux  # type: ignore[import-untyped]
 
 BACKUP_SCRIPT = pathlib.Path("/usr/local/sbin/grayhaven-restic-backup")
 DEFAULT_CONFIG_PATH = pathlib.Path("/usr/local/sbin/grayhaven-restic-backup")
+RESTIC_METRICS_PATH = pathlib.Path(
+    "/var/lib/grayhaven/observability/textfile/restic.prom"
+)
 MIN_SNAPSHOT_PREFIX = 8
+RESTIC_REPOSITORY_METRIC_PATTERN = re.compile(
+    r"^grayhaven_restic_repository_last_success_timestamp_seconds"
+    r'\{host="([^"]+)",repository="([^"]+)"\}\s+([0-9]+(?:\.[0-9]+)?)$'
+)
 
 
 # ---------------------------------------------------------------------------
@@ -215,10 +222,14 @@ class BackupService:
     """Business logic for grayhaven-backupctl commands."""
 
     def __init__(
-        self, config: BackupConfig, runner: CommandRunner | None = None
+        self,
+        config: BackupConfig,
+        runner: CommandRunner | None = None,
+        metrics_path: pathlib.Path = RESTIC_METRICS_PATH,
     ) -> None:
         self.config = config
         self.runner = runner or CommandRunner()
+        self.metrics_path = metrics_path
         self.journal = JournalLogger(self.runner)
 
     def repositories(self, selector: str) -> list[Repository]:
@@ -499,8 +510,28 @@ class BackupService:
         self.run_restic(
             repo, ["forget", "--keep-daily", str(self.config.keep_daily), "--prune"]
         )
+        self.record_backup_success([repo.name])
         if verbose:
             print(f"Repository: {repo.location}")
+
+    def record_backup_success(self, repository_labels: Sequence[str]) -> None:
+        """Update observability textfile metrics after a successful backup."""
+
+        if not repository_labels or not self.metrics_path.parent.is_dir():
+            return
+
+        host = hostname_fqdn()
+        backup_timestamp = current_epoch_seconds()
+        repository_timestamps = read_existing_repository_metrics(
+            self.metrics_path, host
+        )
+        for label in repository_labels:
+            repository_timestamps[label] = backup_timestamp
+
+        content = render_restic_success_metrics(
+            host, backup_timestamp, repository_timestamps
+        )
+        atomic_write_textfile(self.metrics_path, content)
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +544,90 @@ def hostname_fqdn() -> str:
         ["/usr/bin/hostname", "-f"], check=True, text=True, stdout=subprocess.PIPE
     )
     return result.stdout.strip()
+
+
+def current_epoch_seconds() -> int:
+    """Return the current Unix timestamp for Prometheus textfile metrics."""
+
+    return int(datetime.now(tz=UTC).timestamp())
+
+
+def read_existing_repository_metrics(
+    metrics_path: pathlib.Path, host: str
+) -> dict[str, int]:
+    """Read existing repository-specific timestamps for the current host."""
+
+    try:
+        lines = metrics_path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return {}
+
+    repository_timestamps: dict[str, int] = {}
+    for line in lines:
+        match = RESTIC_REPOSITORY_METRIC_PATTERN.match(line)
+        if not match:
+            continue
+        metric_host, repository, timestamp = match.groups()
+        if metric_host != host:
+            continue
+        repository_timestamps[repository] = int(float(timestamp))
+    return repository_timestamps
+
+
+def render_restic_success_metrics(
+    host: str, backup_timestamp: int, repository_timestamps: dict[str, int]
+) -> str:
+    """Render restic success metrics in Prometheus textfile format."""
+
+    backup_help = (
+        "# HELP grayhaven_restic_backup_last_success_timestamp_seconds "
+        "Last successful backup time."
+    )
+    repository_help = (
+        "# HELP grayhaven_restic_repository_last_success_timestamp_seconds "
+        "Last restic backup by repository."
+    )
+    lines = [
+        backup_help,
+        "# TYPE grayhaven_restic_backup_last_success_timestamp_seconds gauge",
+        (
+            "grayhaven_restic_backup_last_success_timestamp_seconds"
+            f'{{host="{host}"}} {backup_timestamp}'
+        ),
+        repository_help,
+        "# TYPE grayhaven_restic_repository_last_success_timestamp_seconds gauge",
+    ]
+    lines.extend(
+        (
+            "grayhaven_restic_repository_last_success_timestamp_seconds"
+            f'{{host="{host}",repository="{repository}"}} '
+            f"{repository_timestamps[repository]}"
+        )
+        for repository in sorted(repository_timestamps)
+    )
+    return "\n".join(lines) + "\n"
+
+
+def atomic_write_textfile(path: pathlib.Path, content: str) -> None:
+    """Atomically write a root-readable textfile collector file."""
+
+    tmp_path: pathlib.Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f"{path.name}.",
+            delete=False,
+        ) as tmp_file:
+            tmp_file.write(content)
+            tmp_path = pathlib.Path(tmp_file.name)
+        os.chmod(tmp_path, 0o644)
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            with contextlib.suppress(OSError):
+                tmp_path.unlink()
 
 
 def parse_restic_time(value: str) -> datetime:

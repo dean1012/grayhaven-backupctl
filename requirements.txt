@@ -1,1 +1,2 @@
-parsedatetime==2.6
+parsedatetime==2.6 \
+    --hash=sha256:cb96edd7016872f58479e35879294258c71437195760746faffedb692aef000b
