@@ -8,6 +8,7 @@ import io
 import json
 import os
 import pathlib
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -268,6 +269,22 @@ class GrayhavenBackupctlTests(unittest.TestCase):
 
         self.assertIsNotNone(parsed)
         self.assertIsNotNone(parsed.tzinfo)
+
+    def test_parse_human_time_accepts_aware_natural_language_result(self) -> None:
+        class FakeContext:
+            hasDateOrTime = True
+
+        aware_time = datetime.now().astimezone()
+        calendar = mock.Mock()
+        calendar.parseDT.return_value = (aware_time, FakeContext())
+
+        with mock.patch.object(
+            backupctl_module.parsedatetime, "Calendar", return_value=calendar
+        ):
+            parsed = backupctl_module.parse_human_time("fake aware fuzzy time")
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.tzinfo, aware_time.tzinfo)
 
     def test_parse_restic_time_assumes_utc_for_naive_timestamp(self) -> None:
         parsed = backupctl_module.parse_restic_time("2026-06-27T01:02:03")
@@ -1107,6 +1124,52 @@ class GrayhavenBackupctlTests(unittest.TestCase):
             metrics,
         )
 
+    def test_repository_metrics_ignore_missing_file_and_other_hosts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            metrics_path = pathlib.Path(temp_dir) / "restic.prom"
+            repository_metric = (
+                "grayhaven_restic_repository_last_success_timestamp_seconds"
+            )
+            metrics_path.write_text(
+                "\n".join(
+                    [
+                        "not a metric",
+                        (
+                            f'{repository_metric}{{host="other.example.com",'
+                            'repository="remote"} 123'
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            self.assertIsInstance(backupctl_module.current_epoch_seconds(), int)
+            self.assertEqual(
+                backupctl_module.read_existing_repository_metrics(
+                    pathlib.Path(temp_dir) / "missing.prom", "host.example.com"
+                ),
+                {},
+            )
+            self.assertEqual(
+                backupctl_module.read_existing_repository_metrics(
+                    metrics_path, "host.example.com"
+                ),
+                {},
+            )
+
+    def test_atomic_write_textfile_cleans_temp_file_after_replace_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            metrics_path = pathlib.Path(temp_dir) / "restic.prom"
+
+            with mock.patch.object(
+                backupctl_module.os, "replace", side_effect=OSError("replace failed")
+            ):
+                with self.assertRaisesRegex(OSError, "replace failed"):
+                    backupctl_module.atomic_write_textfile(metrics_path, "metric 1\n")
+
+            self.assertEqual(list(pathlib.Path(temp_dir).iterdir()), [])
+
     def test_record_backup_success_skips_without_textfile_dir(self) -> None:
         runner = FakeRunner()
         metrics_path = pathlib.Path("/missing/grayhaven/restic.prom")
@@ -1251,6 +1314,9 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         )
         self.assertEqual(prefixes["aaaaaaaa11111111222222223333333344444444"], 8)
 
+        short_prefixes = backupctl_module.unique_prefix_lengths(["abc12345"])
+        self.assertEqual(short_prefixes["abc12345"], 8)
+
     def test_print_helpers_render_empty_and_populated_results(self) -> None:
         snapshot = backupctl_module.Snapshot(
             repo="local",
@@ -1301,6 +1367,19 @@ class GrayhavenBackupctlTests(unittest.TestCase):
             "complete -F _grayhaven_backupctl grayhaven-backupctl", stdout.getvalue()
         )
         config_loader.assert_not_called()
+
+    def test_main_module_entrypoint_prints_help(self) -> None:
+        with (
+            mock.patch.object(sys, "argv", ["grayhaven-backupctl"]),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+            self.assertRaises(SystemExit) as exc,
+        ):
+            runpy.run_path(str(MODULE_PATH), run_name="__main__")
+
+        self.assertEqual(exc.exception.code, 0)
+        self.assertIn(
+            "Manage Grayhaven local and remote restic backups", stdout.getvalue()
+        )
 
     def test_bash_completion_includes_operator_options(self) -> None:
         completion = backupctl_module.bash_completion_script()
