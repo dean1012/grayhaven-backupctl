@@ -764,8 +764,6 @@ def first_matching_path(requested_path: str, listed_paths: list[str]) -> str | N
     for path in listed_paths:
         if (path.rstrip("/") or "/") == normalized:
             return path
-    if listed_paths and (listed_paths[0].rstrip("/") or "/") == normalized:
-        return listed_paths[0]
     return None
 
 
