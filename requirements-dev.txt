@@ -1,5 +1,5 @@
 coverage==7.15.0
-mypy==2.1.0
+mypy==2.2.0
 pip-audit==2.10.1
 ruff==0.15.20
 selinux==0.3.0
