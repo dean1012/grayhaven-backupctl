@@ -57,6 +57,18 @@ git ls-files '*.md' | xargs -r markdownlint-cli2
 The coverage report measures application code and fails if coverage falls below
 the 90% threshold configured in `pyproject.toml`.
 
+## Version Workflow
+
+`VERSION` is the source of the operator-facing semantic version. It must
+contain only `MAJOR.MINOR.PATCH` followed by one newline. Increment the patch
+component for each sequential logical commit while preserving the actual
+checkout short SHA supplied by `grayhaven-backupctl --version`.
+
+When correcting history, renumber affected commits in history order so their
+semantic versions are strictly increasing and no duplicate version is reused.
+Keep the commit-to-version relationship documented in the change, and use a
+non-closing issue reference such as `Refs #<issue-number>`.
+
 CI also generates `coverage.xml` and uploads it to Codecov using GitHub Actions
 OIDC authentication. No `CODECOV_TOKEN` repository secret is required.
 Project coverage checks and pull request comments are configured in
