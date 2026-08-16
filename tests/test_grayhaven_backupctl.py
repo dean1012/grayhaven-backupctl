@@ -25,6 +25,7 @@ from unittest import mock
 
 MODULE_PATH = pathlib.Path(__file__).resolve().parents[1] / "grayhaven-backupctl"
 backupctl_module = ModuleType("grayhaven_backupctl")
+backupctl_module.__file__ = str(MODULE_PATH)
 sys.modules[backupctl_module.__name__] = backupctl_module
 SourceFileLoader(backupctl_module.__name__, str(MODULE_PATH)).exec_module(
     backupctl_module
