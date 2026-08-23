@@ -1741,9 +1741,9 @@ class VersioningTests(unittest.TestCase):
                         "grayhaven-backupctl 1.0.0-abc1234",
                     )
 
-    def test_sequential_same_commit_patch_increments(self) -> None:
-        first = backupctl_module.increment_patch("1.0.0")
-        second = backupctl_module.increment_patch(first)
+    def test_sequential_same_commit_build_increments(self) -> None:
+        first = backupctl_module.increment_build("1.0.0")
+        second = backupctl_module.increment_build(first)
 
         self.assertEqual(first, "1.0.1")
         self.assertEqual(second, "1.0.2")

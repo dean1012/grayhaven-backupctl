@@ -53,7 +53,7 @@ def parse_semantic_version(version: str) -> tuple[int, int, int]:
     match = SEMANTIC_VERSION_PATTERN.fullmatch(version)
     if not match:
         raise GrayhavenBackupctlError(
-            f"Malformed semantic version {version!r}; expected MAJOR.MINOR.PATCH"
+            f"Malformed semantic version {version!r}; expected MAJOR.MINOR.BUILD"
         )
     return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
 
@@ -69,26 +69,26 @@ def read_version(path: pathlib.Path = VERSION_PATH) -> str:
         ) from exc
     if not VERSION_FILE_PATTERN.fullmatch(content):
         raise GrayhavenBackupctlError(
-            f"Malformed VERSION in {path}; expected exactly MAJOR.MINOR.PATCH "
+            f"Malformed VERSION in {path}; expected exactly MAJOR.MINOR.BUILD "
             "followed by one newline"
         )
     return content[:-1]
 
 
-def increment_patch(version: str) -> str:
-    """Increment the patch component of a semantic version."""
+def increment_build(version: str) -> str:
+    """Increment the build component of a semantic version."""
 
-    major, minor, patch = parse_semantic_version(version)
-    return f"{major}.{minor}.{patch + 1}"
+    major, minor, build = parse_semantic_version(version)
+    return f"{major}.{minor}.{build + 1}"
 
 
 def renumber_version_history(versions: Sequence[str]) -> list[str]:
-    """Renumber every retained work commit to the next patch in history order."""
+    """Renumber every retained work commit to the next build in history order."""
 
     corrected: list[str] = []
     for version in versions:
         parse_semantic_version(version)
-        corrected.append(version if not corrected else increment_patch(corrected[-1]))
+        corrected.append(version if not corrected else increment_build(corrected[-1]))
     return corrected
 
 
