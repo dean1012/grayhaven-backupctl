@@ -51,13 +51,16 @@ Display the installed utility version:
 grayhaven-backupctl --version
 ```
 
-The output is `grayhaven-backupctl MAJOR.MINOR.PATCH-SHORTSHA`. In a checkout,
+The output is `grayhaven-backupctl MAJOR.MINOR.BUILD-SHORTSHA`. In a checkout,
 `SHORTSHA` is the abbreviation of the actual checked-out `HEAD` commit. An
 installed copy without adjacent Git metadata reads the full commit ID from a
 `COMMIT_SHA` file beside the copied implementation. The file must contain
 exactly one lowercase 40-hex commit ID followed by one newline. Checkout Git
 metadata takes precedence; if neither source is valid, the command fails
 clearly instead of emitting an unverifiable identity.
+
+For the canonical contributor version and release-tag procedure, see
+[Version Workflow](../CONTRIBUTING.md#version-workflow).
 
 [Back to top](#operations)
 

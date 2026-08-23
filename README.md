@@ -49,6 +49,9 @@ the copied implementation. That file must contain exactly one lowercase
 40-hex commit ID followed by one newline. Checkout Git metadata takes
 precedence; if neither source is valid, `--version` fails clearly.
 
+For the canonical contributor version and release-tag procedure, see
+[Version Workflow](CONTRIBUTING.md#version-workflow).
+
 [Back to top](#grayhaven-systems-llc-backup-grayhaven-backupctl)
 
 ## Managed Environment
