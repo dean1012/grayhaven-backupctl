@@ -25,6 +25,7 @@ from unittest import mock
 
 MODULE_PATH = pathlib.Path(__file__).resolve().parents[1] / "grayhaven-backupctl"
 backupctl_module = ModuleType("grayhaven_backupctl")
+backupctl_module.__file__ = str(MODULE_PATH)
 sys.modules[backupctl_module.__name__] = backupctl_module
 SourceFileLoader(backupctl_module.__name__, str(MODULE_PATH)).exec_module(
     backupctl_module
@@ -1722,6 +1723,161 @@ class RecordingService(FakeService):
 
     def backup(self, selector, verbose):
         self.calls.append(("backup", selector, verbose))
+
+
+class VersioningTests(unittest.TestCase):
+    """Coverage for immutable semantic version and checkout identity output."""
+
+    def test_initial_versioning(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            version_path = pathlib.Path(temp_dir) / "VERSION"
+            version_path.write_bytes(b"1.0.0\n")
+            with mock.patch.object(backupctl_module, "VERSION_PATH", version_path):
+                with mock.patch.object(
+                    backupctl_module, "resolve_short_sha", return_value="abc1234"
+                ):
+                    self.assertEqual(
+                        backupctl_module.package_version(),
+                        "grayhaven-backupctl 1.0.0-abc1234",
+                    )
+
+    def test_sequential_same_commit_build_increments(self) -> None:
+        first = backupctl_module.increment_build("1.0.0")
+        second = backupctl_module.increment_build(first)
+
+        self.assertEqual(first, "1.0.1")
+        self.assertEqual(second, "1.0.2")
+        self.assertEqual(
+            backupctl_module.format_version(second, "abc1234"),
+            "grayhaven-backupctl 1.0.2-abc1234",
+        )
+
+    def test_malformed_semantic_version_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            backupctl_module.GrayhavenBackupctlError,
+            "Malformed semantic version",
+        ):
+            backupctl_module.parse_semantic_version("1.0")
+
+    def test_missing_version_file_fails_clearly(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(
+                backupctl_module.GrayhavenBackupctlError,
+                "Unable to read VERSION",
+            ):
+                backupctl_module.read_version(pathlib.Path(temp_dir) / "VERSION")
+
+    def test_actual_short_sha_output(self) -> None:
+        result = subprocess.CompletedProcess(
+            args=["git"], returncode=0, stdout="597beab\n", stderr=""
+        )
+        with mock.patch.object(
+            backupctl_module.subprocess, "run", return_value=result
+        ) as run:
+            short_sha = backupctl_module.resolve_short_sha(pathlib.Path("/repo"))
+
+        self.assertEqual(short_sha, "597beab")
+        self.assertEqual(
+            run.call_args.args[0],
+            ["/usr/bin/git", "rev-parse", "--short", "HEAD"],
+        )
+
+    def test_installed_metadata_supplies_short_sha_without_git(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            metadata_path = pathlib.Path(temp_dir) / "COMMIT_SHA"
+            metadata_path.write_bytes(b"0123456789abcdef0123456789abcdef01234567\n")
+            with mock.patch.object(
+                backupctl_module.subprocess,
+                "run",
+                side_effect=OSError("git unavailable"),
+            ):
+                self.assertEqual(
+                    backupctl_module.resolve_short_sha(
+                        pathlib.Path(temp_dir), metadata_path
+                    ),
+                    "0123456",
+                )
+
+    def test_missing_installed_metadata_fails_clearly(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(
+                backupctl_module.subprocess,
+                "run",
+                side_effect=OSError("git unavailable"),
+            ):
+                with self.assertRaisesRegex(
+                    backupctl_module.GrayhavenBackupctlError,
+                    "Unable to determine commit short SHA",
+                ):
+                    backupctl_module.resolve_short_sha(
+                        pathlib.Path(temp_dir),
+                        pathlib.Path(temp_dir) / "COMMIT_SHA",
+                    )
+
+    def test_malformed_installed_metadata_fails_clearly(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            metadata_path = pathlib.Path(temp_dir) / "COMMIT_SHA"
+            metadata_path.write_bytes(b"not-a-commit\n")
+            with mock.patch.object(
+                backupctl_module.subprocess,
+                "run",
+                side_effect=OSError("git unavailable"),
+            ):
+                with self.assertRaisesRegex(
+                    backupctl_module.GrayhavenBackupctlError,
+                    "Malformed COMMIT_SHA",
+                ):
+                    backupctl_module.resolve_short_sha(
+                        pathlib.Path(temp_dir), metadata_path
+                    )
+
+    def test_malformed_short_sha_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            backupctl_module.GrayhavenBackupctlError,
+            "Malformed commit short SHA",
+        ):
+            backupctl_module.format_version("1.0.0", "not-a-sha")
+
+    def test_main_version_success(self) -> None:
+        with mock.patch.object(
+            backupctl_module,
+            "package_version",
+            return_value="grayhaven-backupctl 1.0.2-abc1234",
+        ):
+            with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                status = backupctl_module.main(["--version"])
+
+        self.assertEqual(status, 0)
+        self.assertEqual(stdout.getvalue(), "grayhaven-backupctl 1.0.2-abc1234\n")
+
+    def test_main_version_reports_error(self) -> None:
+        with mock.patch.object(
+            backupctl_module,
+            "package_version",
+            side_effect=backupctl_module.GrayhavenBackupctlError("version broken"),
+        ):
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                status = backupctl_module.main(["--version"])
+
+        self.assertEqual(status, 1)
+        self.assertEqual(stderr.getvalue(), "grayhaven-backupctl: version broken\n")
+
+    def test_malformed_version_fails_clearly(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            version_path = pathlib.Path(temp_dir) / "VERSION"
+            version_path.write_bytes(b"1.0\n")
+            with self.assertRaisesRegex(
+                backupctl_module.GrayhavenBackupctlError, "Malformed VERSION"
+            ):
+                backupctl_module.read_version(version_path)
+
+    def test_history_correction_renumbers_versions(self) -> None:
+        self.assertEqual(
+            backupctl_module.renumber_version_history(
+                ["1.0.0", "1.0.2", "1.0.0", "1.0.4"]
+            ),
+            ["1.0.0", "1.0.1", "1.0.2", "1.0.3"],
+        )
 
 
 # ---------------------------------------------------------------------------

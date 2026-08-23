@@ -6,6 +6,7 @@ Thank you for your interest in improving `grayhaven-backupctl`.
 
 - [Development Setup](#development-setup)
 - [Validation](#validation)
+- [Version Workflow](#version-workflow)
 - [Pull Requests](#pull-requests)
 - [Documentation Guidelines](#documentation-guidelines)
 
@@ -56,6 +57,30 @@ git ls-files '*.md' | xargs -r markdownlint-cli2
 
 The coverage report measures application code and fails if coverage falls below
 the 90% threshold configured in `pyproject.toml`.
+
+## Version Workflow
+
+`VERSION` is the canonical release source and must contain exactly
+`MAJOR.MINOR.BUILD` followed by one newline. When selecting a new major or
+minor, set `BUILD` to `0`. For each later retained work commit, increment
+`BUILD` by exactly one. If retained history is rewritten, renumber affected
+builds in commit order so there are no gaps or duplicates. Use the applicable
+non-closing issue reference in related commits, such as `Refs #<issue-number>`.
+
+After `main` is accepted and final, create one signed annotated tag targeting
+the accepted full `main` commit, verify its signature and target, and push only
+that tag:
+
+```bash
+git tag -s -a "v<semantic-version>" "<accepted-full-main-commit>" \
+  -m "Release v<semantic-version>"
+git verify-tag "v<semantic-version>"
+git rev-parse "v<semantic-version>^{commit}"
+git push origin "v<semantic-version>"
+```
+
+Confirm the `git rev-parse` result matches the accepted full `main` commit
+before pushing the tag.
 
 CI also generates `coverage.xml` and uploads it to Codecov using GitHub Actions
 OIDC authentication. No `CODECOV_TOKEN` repository secret is required.

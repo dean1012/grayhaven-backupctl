@@ -36,6 +36,22 @@ The utility supports:
 - SELinux context restoration after files are restored;
 - journald logging for backup and restore actions.
 
+Show the immutable semantic version and the checked-out commit identity:
+
+```bash
+grayhaven-backupctl --version
+# grayhaven-backupctl 1.0.0-<short-commit-sha>
+```
+
+In a Git checkout, the suffix is resolved from the actual `HEAD` commit. An
+installed copy without adjacent Git metadata uses a `COMMIT_SHA` file beside
+the copied implementation. That file must contain exactly one lowercase
+40-hex commit ID followed by one newline. Checkout Git metadata takes
+precedence; if neither source is valid, `--version` fails clearly.
+
+For the canonical contributor version and release-tag procedure, see
+[Version Workflow](CONTRIBUTING.md#version-workflow).
+
 [Back to top](#grayhaven-systems-llc-backup-grayhaven-backupctl)
 
 ## Managed Environment

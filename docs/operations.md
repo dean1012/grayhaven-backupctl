@@ -8,6 +8,7 @@ This guide covers operator backup and restore workflows using
 ## Table of Contents
 
 - [Overview](#overview)
+- [Version](#version)
 - [Listing Backups](#listing-backups)
 - [Creating Backups](#creating-backups)
 - [Listing Backup Contents](#listing-backup-contents)
@@ -39,6 +40,27 @@ specified.
 
 Relative paths are internalized as absolute paths before backup selection so
 restores behave consistently regardless of the operator's current directory.
+
+[Back to top](#operations)
+
+## Version
+
+Display the installed utility version:
+
+```bash
+grayhaven-backupctl --version
+```
+
+The output is `grayhaven-backupctl MAJOR.MINOR.BUILD-SHORTSHA`. In a checkout,
+`SHORTSHA` is the abbreviation of the actual checked-out `HEAD` commit. An
+installed copy without adjacent Git metadata reads the full commit ID from a
+`COMMIT_SHA` file beside the copied implementation. The file must contain
+exactly one lowercase 40-hex commit ID followed by one newline. Checkout Git
+metadata takes precedence; if neither source is valid, the command fails
+clearly instead of emitting an unverifiable identity.
+
+For the canonical contributor version and release-tag procedure, see
+[Version Workflow](../CONTRIBUTING.md#version-workflow).
 
 [Back to top](#operations)
 
