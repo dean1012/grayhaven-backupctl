@@ -101,6 +101,14 @@ Create a focused feature branch for each change. Reference the related issue in
 each commit and include `Closes #<issue-number>` in the pull request
 description when the pull request should close an issue after merging.
 
+The `main` branch is protected and forbids direct pushes. Open a ready-for-review
+(non-draft) pull request for every change, resolve all review conversations, and
+wait for the two required checks—`Validate Python` and `Unit Tests`—to pass.
+Integrate pull requests by squash merge only; do not use merge commits or
+rebases, and do not bypass branch protection, reviews, or required checks. The
+repository does not automatically delete merged feature branches, so manually
+delete the local and remote feature branch after the pull request is merged.
+
 Sign each commit so GitHub can verify its authorship. The `main` branch ruleset
 requires signed commits before merging:
 
