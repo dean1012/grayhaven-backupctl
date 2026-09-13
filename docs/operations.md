@@ -298,8 +298,9 @@ System-wide completion installation is handled by
 
 ## Retention Notes
 
-`grayhaven-backupctl` is subject to configured backup retention rules. Running
-multiple manual backups within the configured retention period may result in
-older backups being pruned.
+`grayhaven-backupctl` applies configured retention rules independently for each
+host. Changing the paths included in a backup does not create a separate
+retention group. Running multiple manual backups within the configured
+retention period may result in older backups for that host being pruned.
 
 [Back to top](#operations)

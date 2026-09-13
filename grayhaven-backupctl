@@ -624,7 +624,15 @@ class BackupService:
             ],
         )
         self.run_restic(
-            repo, ["forget", "--keep-daily", str(self.config.keep_daily), "--prune"]
+            repo,
+            [
+                "forget",
+                "--group-by",
+                "host",
+                "--keep-daily",
+                str(self.config.keep_daily),
+                "--prune",
+            ],
         )
         self.record_backup_success([repo.name])
         if verbose:

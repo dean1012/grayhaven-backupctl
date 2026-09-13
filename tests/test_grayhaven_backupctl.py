@@ -1066,7 +1066,13 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         self.assertIn(
             list(
                 restic_key(
-                    "/var/backups/restic", "forget", "--keep-daily", "7", "--prune"
+                    "/var/backups/restic",
+                    "forget",
+                    "--group-by",
+                    "host",
+                    "--keep-daily",
+                    "7",
+                    "--prune",
                 )
             ),
             runner.calls,
