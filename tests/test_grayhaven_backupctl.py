@@ -792,17 +792,18 @@ class GrayhavenBackupctlTests(unittest.TestCase):
                 return ""
 
             with mock.patch.object(service, "run_restic", side_effect=fake_run_restic):
-                with mock.patch.object(
-                    backupctl_module, "copy_restored_path"
-                ) as copy_path:
-                    with mock.patch("builtins.input", return_value="RESTORE"):
-                        with contextlib.redirect_stdout(io.StringIO()):
-                            with contextlib.redirect_stderr(io.StringIO()):
-                                service.restore(plan, force=False, verbose=False)
+                with mock.patch("builtins.input", side_effect=["n", "y"]) as prompt:
+                    with contextlib.redirect_stdout(io.StringIO()) as skipped_output:
+                        service.restore(plan, force=False, verbose=False)
+                    self.assertIn("Skipped", skipped_output.getvalue())
+                    self.assertEqual(destination.read_text(encoding="utf-8"), "old")
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        service.restore(plan, force=False, verbose=False)
 
-            self.assertTrue(copy_path.call_args.kwargs["overwrite"])
+            self.assertEqual(prompt.call_count, 2)
+            self.assertEqual(destination.read_text(encoding="utf-8"), "restored")
 
-    def test_copy_restored_path_replaces_existing_directory_after_confirmation(
+    def test_copy_restored_path_merges_existing_directory(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -823,7 +824,160 @@ class GrayhavenBackupctlTests(unittest.TestCase):
                     )
 
             self.assertTrue((destination / "new.txt").exists())
-            self.assertFalse((destination / "old.txt").exists())
+            self.assertTrue((destination / "old.txt").exists())
+
+    def test_directory_restore_prompts_per_conflicting_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            source = root / "source"
+            destination = root / "destination"
+            source.mkdir()
+            destination.mkdir()
+            for name in ("first.txt", "second.txt"):
+                (source / name).write_text("new", encoding="utf-8")
+                (destination / name).write_text("old", encoding="utf-8")
+            (destination / "unrelated.txt").write_text("keep", encoding="utf-8")
+
+            with (
+                mock.patch("builtins.input", side_effect=["n", "y"]) as prompt,
+                mock.patch.object(
+                    backupctl_module.selinux, "is_selinux_enabled", return_value=0
+                ),
+            ):
+                backupctl_module.copy_restored_path(
+                    source, destination, overwrite=False
+                )
+
+            self.assertEqual(prompt.call_count, 2)
+            self.assertEqual(
+                (destination / "first.txt").read_text(encoding="utf-8"), "old"
+            )
+            self.assertEqual(
+                (destination / "second.txt").read_text(encoding="utf-8"), "new"
+            )
+            self.assertEqual(
+                (destination / "unrelated.txt").read_text(encoding="utf-8"),
+                "keep",
+            )
+
+    def test_restore_replaces_leaf_symlink_without_following_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            source = root / "source.txt"
+            destination = root / "destination.txt"
+            outside = root / "outside.txt"
+            source.write_text("restored", encoding="utf-8")
+            outside.write_text("outside", encoding="utf-8")
+            destination.symlink_to(outside)
+
+            with mock.patch.object(
+                backupctl_module.selinux, "is_selinux_enabled", return_value=0
+            ):
+                backupctl_module.copy_restored_path(source, destination, overwrite=True)
+
+            self.assertFalse(destination.is_symlink())
+            self.assertEqual(destination.read_text(encoding="utf-8"), "restored")
+            self.assertEqual(outside.read_text(encoding="utf-8"), "outside")
+
+    def test_restore_preserves_archived_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            source = root / "source-link"
+            destination = root / "destination-link"
+            source.symlink_to("target.txt")
+
+            with mock.patch.object(
+                backupctl_module.selinux, "is_selinux_enabled", return_value=0
+            ):
+                backupctl_module.copy_restored_path(source, destination, overwrite=True)
+
+            self.assertTrue(destination.is_symlink())
+            self.assertEqual(os.readlink(destination), "target.txt")
+
+    def test_restore_rejects_destination_symlink_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            source = root / "source.txt"
+            outside = root / "outside"
+            outside.mkdir()
+            source.write_text("restored", encoding="utf-8")
+            (root / "link").symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(
+                backupctl_module.GrayhavenBackupctlError, "safe directory"
+            ):
+                backupctl_module.copy_restored_path(
+                    source, root / "link" / "file.txt", overwrite=True
+                )
+            self.assertFalse((outside / "file.txt").exists())
+
+    def test_restore_replaces_conflicting_directory_with_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            source = root / "source.txt"
+            destination = root / "destination"
+            source.write_text("restored", encoding="utf-8")
+            destination.mkdir()
+            (destination / "old.txt").write_text("old", encoding="utf-8")
+
+            with mock.patch.object(
+                backupctl_module.selinux, "is_selinux_enabled", return_value=0
+            ):
+                backupctl_module.copy_restored_path(source, destination, overwrite=True)
+
+            self.assertTrue(destination.is_file())
+            self.assertEqual(destination.read_text(encoding="utf-8"), "restored")
+
+    def test_restore_replaces_conflicting_file_with_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            source = root / "source"
+            destination = root / "destination"
+            source.mkdir()
+            (source / "new.txt").write_text("new", encoding="utf-8")
+            destination.write_text("old", encoding="utf-8")
+
+            with (
+                mock.patch("builtins.input", return_value="y") as prompt,
+                mock.patch.object(
+                    backupctl_module.selinux, "is_selinux_enabled", return_value=0
+                ),
+            ):
+                backupctl_module.copy_restored_path(
+                    source, destination, overwrite=False
+                )
+
+            prompt.assert_called_once()
+            self.assertEqual(
+                (destination / "new.txt").read_text(encoding="utf-8"), "new"
+            )
+
+    def test_restore_skips_declined_leaf_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            source = root / "source.txt"
+            destination = root / "destination.txt"
+            source.write_text("new", encoding="utf-8")
+            destination.write_text("old", encoding="utf-8")
+
+            with mock.patch("builtins.input", return_value="n"):
+                restored = backupctl_module.copy_restored_path(
+                    source, destination, overwrite=False
+                )
+
+            self.assertFalse(restored)
+            self.assertEqual(destination.read_text(encoding="utf-8"), "old")
+
+    def test_restore_rejects_filesystem_root_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = pathlib.Path(temp_dir) / "source.txt"
+            source.write_text("restored", encoding="utf-8")
+            with self.assertRaisesRegex(
+                backupctl_module.GrayhavenBackupctlError, "filesystem root"
+            ):
+                backupctl_module.copy_restored_path(
+                    source, pathlib.Path("/"), overwrite=True
+                )
 
     def test_copy_restored_path_preserves_file_ownership(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -832,21 +986,13 @@ class GrayhavenBackupctlTests(unittest.TestCase):
             destination = root / "destination.txt"
             source.write_text("restored", encoding="utf-8")
 
-            with mock.patch.object(backupctl_module.os, "chown") as chown:
-                with mock.patch.object(
-                    backupctl_module.selinux, "is_selinux_enabled", return_value=0
-                ):
-                    backupctl_module.copy_restored_path(
-                        source, destination, overwrite=True
-                    )
+            with mock.patch.object(
+                backupctl_module.selinux, "is_selinux_enabled", return_value=0
+            ):
+                backupctl_module.copy_restored_path(source, destination, overwrite=True)
 
-            source_stat = source.lstat()
-            chown.assert_called_once_with(
-                destination,
-                source_stat.st_uid,
-                source_stat.st_gid,
-                follow_symlinks=False,
-            )
+            self.assertEqual(destination.stat().st_uid, source.stat().st_uid)
+            self.assertEqual(destination.stat().st_gid, source.stat().st_gid)
 
     def test_copy_restored_path_overwrites_existing_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -875,22 +1021,24 @@ class GrayhavenBackupctlTests(unittest.TestCase):
             nested_file.parent.mkdir(parents=True)
             nested_file.write_text("restored", encoding="utf-8")
 
-            with mock.patch.object(backupctl_module.os, "chown") as chown:
-                with mock.patch.object(
-                    backupctl_module.selinux, "is_selinux_enabled", return_value=0
-                ):
-                    backupctl_module.copy_restored_path(
-                        source, destination, overwrite=True
-                    )
+            with mock.patch.object(
+                backupctl_module.selinux, "is_selinux_enabled", return_value=0
+            ):
+                backupctl_module.copy_restored_path(source, destination, overwrite=True)
 
-            expected_paths = {
-                destination,
-                destination / "nested",
-                destination / "nested" / "file.txt",
-            }
-            self.assertEqual(
-                {call.args[0] for call in chown.call_args_list}, expected_paths
-            )
+            for relative in (
+                pathlib.Path(),
+                pathlib.Path("nested"),
+                pathlib.Path("nested/file.txt"),
+            ):
+                self.assertEqual(
+                    (destination / relative).stat().st_uid,
+                    (source / relative).stat().st_uid,
+                )
+                self.assertEqual(
+                    (destination / relative).stat().st_gid,
+                    (source / relative).stat().st_gid,
+                )
 
     def test_copy_restored_path_preserves_restored_ancestor_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -905,16 +1053,15 @@ class GrayhavenBackupctlTests(unittest.TestCase):
             source_home.chmod(0o755)
             source_user.chmod(0o700)
 
-            with mock.patch.object(backupctl_module.os, "chown"):
-                with mock.patch.object(
-                    backupctl_module.selinux, "is_selinux_enabled", return_value=0
-                ):
-                    backupctl_module.copy_restored_path(
-                        source_file,
-                        destination,
-                        overwrite=True,
-                        source_root=source_root,
-                    )
+            with mock.patch.object(
+                backupctl_module.selinux, "is_selinux_enabled", return_value=0
+            ):
+                backupctl_module.copy_restored_path(
+                    source_file,
+                    destination,
+                    overwrite=True,
+                    source_root=source_root,
+                )
 
             self.assertEqual(
                 oct((root / "target" / "home").stat().st_mode & 0o777), "0o755"
@@ -960,7 +1107,7 @@ class GrayhavenBackupctlTests(unittest.TestCase):
             ):
                 backupctl_module.copy_restored_path(source, destination, overwrite=True)
 
-            restorecon.assert_called_once_with(os.path.abspath(destination), 3)
+            restorecon.assert_called_once_with(os.path.abspath(destination), 2)
 
     def test_copy_restored_path_skips_selinux_context_without_policy_entry(
         self,
@@ -992,11 +1139,9 @@ class GrayhavenBackupctlTests(unittest.TestCase):
 
     def test_confirm_overwrite_rejects_unconfirmed_restore(self) -> None:
         with mock.patch("builtins.input", return_value="nope"):
-            with contextlib.redirect_stderr(io.StringIO()):
-                with self.assertRaisesRegex(
-                    backupctl_module.GrayhavenBackupctlError, "cancelled"
-                ):
-                    backupctl_module.confirm_overwrite(pathlib.Path("/restore/file"))
+            self.assertFalse(
+                backupctl_module.confirm_overwrite(pathlib.Path("/restore/file"))
+            )
 
     def test_backup_all_uses_authoritative_script(self) -> None:
         runner = FakeRunner({(str(backupctl_module.BACKUP_SCRIPT),): ""})

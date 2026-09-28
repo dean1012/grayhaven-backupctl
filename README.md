@@ -31,8 +31,9 @@ The utility supports:
   path;
 - natural-language and explicit timestamp filters;
 - file, directory, glob, and path-file restore selection;
-- in-place restore with overwrite confirmation;
-- target-directory restore that preserves the archived absolute path tree;
+- in-place restore that merges directories and confirms each conflicting entry;
+- target-directory restore that preserves the archived absolute path tree and
+  merges it with existing content;
 - SELinux context restoration after files are restored;
 - journald logging for backup and restore actions.
 

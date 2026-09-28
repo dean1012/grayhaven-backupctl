@@ -12,11 +12,13 @@ import json
 import os
 import pathlib
 import re
+import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -529,11 +531,6 @@ class BackupService:
                 f"Restoring {item.source_path} from {item.snapshot.repo} snapshot "
                 f"[{item.snapshot.short_id}] taken at {timestamp}"
             )
-            overwrite = force
-            if item.destination_path.exists() and not force:
-                confirm_overwrite(item.destination_path)
-                overwrite = True
-
             with tempfile.TemporaryDirectory(
                 prefix="grayhaven-backupctl-restore-"
             ) as temp_root:
@@ -550,16 +547,19 @@ class BackupService:
                     ],
                 )
                 restored_source = temp_path / relative_tree(item.source_path)
-                if not restored_source.exists():
+                if not os.path.lexists(restored_source):
                     raise GrayhavenBackupctlError(
                         f"Restic did not restore expected path {item.source_path}"
                     )
-                copy_restored_path(
+                restored = copy_restored_path(
                     restored_source,
                     item.destination_path,
-                    overwrite=overwrite,
+                    overwrite=force,
                     source_root=temp_path,
                 )
+            if not restored:
+                print(f"Skipped {item.destination_path}")
+                continue
             restore_message = (
                 f'action="restore" repo="{item.snapshot.repo}" '
                 f'snapshot="{item.snapshot.short_id}" source="{item.source_path}" '
@@ -838,7 +838,7 @@ def unique_prefix_lengths(snapshot_ids: Iterable[str]) -> dict[str, int]:
 
 def resolve_operator_path(path_value: str) -> str:
     expanded = os.path.expandvars(os.path.expanduser(path_value))
-    return str(pathlib.Path(expanded).resolve(strict=False))
+    return os.path.abspath(expanded)
 
 
 def read_requested_paths(args: argparse.Namespace) -> list[str]:
@@ -916,11 +916,188 @@ def relative_tree(path: str) -> pathlib.Path:
 # ---------------------------------------------------------------------------
 
 
-def confirm_overwrite(path: pathlib.Path) -> None:
-    print(f"Warning: restore will overwrite existing path: {path}", file=sys.stderr)
-    response = input("Type RESTORE to continue: ")
-    if response != "RESTORE":
-        raise GrayhavenBackupctlError("Restore cancelled")
+def confirm_overwrite(path: pathlib.Path) -> bool:
+    """Confirm replacement of one conflicting archive entry."""
+
+    response = input(f"Overwrite {path}? [y/N]: ")
+    return response.lower() in {"y", "yes"}
+
+
+def _archive_metadata(source: pathlib.Path, destination_fd: int) -> None:
+    """Apply archived directory metadata through an already verified descriptor."""
+
+    source_stat = source.lstat()
+    os.fchown(destination_fd, source_stat.st_uid, source_stat.st_gid)
+    os.fchmod(destination_fd, stat.S_IMODE(source_stat.st_mode))
+    os.utime(destination_fd, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
+
+
+@contextlib.contextmanager
+def _destination_parent(
+    destination: pathlib.Path,
+    source: pathlib.Path,
+    source_root: pathlib.Path | None,
+) -> Iterator[int]:
+    """Walk and create destination ancestors without following symlinks."""
+
+    absolute = pathlib.Path(os.path.abspath(destination))
+    if absolute == pathlib.Path("/"):
+        raise GrayhavenBackupctlError("Cannot restore over the filesystem root")
+
+    archived_ancestors: dict[pathlib.Path, pathlib.Path] = {}
+    if source_root is not None:
+        relative_source = source.relative_to(source_root)
+        destination_root = absolute
+        for _ in relative_source.parts:
+            destination_root = destination_root.parent
+        for index in range(1, len(relative_source.parts)):
+            relative_ancestor = pathlib.Path(*relative_source.parts[:index])
+            archived_ancestors[destination_root / relative_ancestor] = (
+                source_root / relative_ancestor
+            )
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    current_fd = os.open("/", flags)
+    current_path = pathlib.Path("/")
+    try:
+        for part in absolute.parts[1:-1]:
+            current_path /= part
+            created = False
+            try:
+                os.mkdir(part, mode=0o700, dir_fd=current_fd)
+                created = True
+            except FileExistsError:
+                pass
+            try:
+                next_fd = os.open(part, flags, dir_fd=current_fd)
+            except OSError as exc:
+                raise GrayhavenBackupctlError(
+                    f"Destination ancestor is not a safe directory: {current_path}"
+                ) from exc
+            os.close(current_fd)
+            current_fd = next_fd
+            if created and current_path in archived_ancestors:
+                _archive_metadata(archived_ancestors[current_path], current_fd)
+        yield current_fd
+    finally:
+        os.close(current_fd)
+
+
+def _existing_entry(parent_fd: int, name: str) -> os.stat_result | None:
+    try:
+        return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def _remove_conflicting_entry(parent_fd: int, name: str, mode: int) -> None:
+    if stat.S_ISDIR(mode):
+        # CPython uses descriptor-relative traversal on Linux, avoiding symlink
+        # substitution while removing a directory that conflicts with a file.
+        shutil.rmtree(name, dir_fd=parent_fd)
+    else:
+        os.unlink(name, dir_fd=parent_fd)
+
+
+def _copy_regular_file(
+    source: pathlib.Path, parent_fd: int, name: str, source_stat: os.stat_result
+) -> None:
+    temporary_name = f".backupctl-{secrets.token_hex(16)}"
+    source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        try:
+            with (
+                os.fdopen(source_fd, "rb", closefd=False) as source_file,
+                os.fdopen(temporary_fd, "wb", closefd=False) as target_file,
+            ):
+                shutil.copyfileobj(source_file, target_file)
+            os.fchown(temporary_fd, source_stat.st_uid, source_stat.st_gid)
+            os.fchmod(temporary_fd, stat.S_IMODE(source_stat.st_mode))
+            os.utime(
+                temporary_fd,
+                ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
+            )
+        finally:
+            os.close(temporary_fd)
+        os.replace(temporary_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+    finally:
+        os.close(source_fd)
+        if _existing_entry(parent_fd, temporary_name) is not None:  # pragma: no cover
+            os.unlink(temporary_name, dir_fd=parent_fd)
+
+
+def _copy_symlink(
+    source: pathlib.Path, parent_fd: int, name: str, source_stat: os.stat_result
+) -> None:
+    temporary_name = f".backupctl-{secrets.token_hex(16)}"
+    os.symlink(os.readlink(source), temporary_name, dir_fd=parent_fd)
+    try:
+        os.chown(
+            temporary_name,
+            source_stat.st_uid,
+            source_stat.st_gid,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        os.utime(
+            temporary_name,
+            ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        os.replace(temporary_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+    finally:
+        if _existing_entry(parent_fd, temporary_name) is not None:  # pragma: no cover
+            os.unlink(temporary_name, dir_fd=parent_fd)
+
+
+def _merge_entry(
+    source: pathlib.Path,
+    parent_fd: int,
+    name: str,
+    destination: pathlib.Path,
+    force: bool,
+) -> bool:
+    source_stat = source.lstat()
+    existing = _existing_entry(parent_fd, name)
+    source_directory = stat.S_ISDIR(source_stat.st_mode)
+    existing_directory = existing is not None and stat.S_ISDIR(existing.st_mode)
+    if existing is not None and not (source_directory and existing_directory):
+        if not force and not confirm_overwrite(destination):
+            return False
+        if existing_directory:
+            _remove_conflicting_entry(parent_fd, name, existing.st_mode)
+            existing = None
+
+    if source_directory:
+        if existing is None or not existing_directory:
+            if existing is not None:
+                _remove_conflicting_entry(parent_fd, name, existing.st_mode)
+            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        child_fd = os.open(name, flags, dir_fd=parent_fd)
+        try:
+            for child in sorted(source.iterdir()):
+                _merge_entry(
+                    child, child_fd, child.name, destination / child.name, force
+                )
+            _archive_metadata(source, child_fd)
+        finally:
+            os.close(child_fd)
+    elif stat.S_ISREG(source_stat.st_mode):
+        _copy_regular_file(source, parent_fd, name, source_stat)
+    elif stat.S_ISLNK(source_stat.st_mode):
+        _copy_symlink(source, parent_fd, name, source_stat)
+    else:  # pragma: no cover
+        raise GrayhavenBackupctlError(f"Unsupported archived file type: {source}")
+    restore_selinux_context(destination)
+    return True
 
 
 def copy_restored_path(
@@ -928,68 +1105,12 @@ def copy_restored_path(
     destination: pathlib.Path,
     overwrite: bool,
     source_root: pathlib.Path | None = None,
-) -> None:
-    if source_root is not None:
-        preserve_restored_ancestor_metadata(source_root, source, destination)
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists() and overwrite:
-        if destination.is_dir() and not destination.is_symlink():
-            shutil.rmtree(destination)
-        else:
-            destination.unlink()
-
-    if source.is_dir():
-        shutil.copytree(source, destination, symlinks=True)
-    else:
-        shutil.copy2(source, destination, follow_symlinks=False)
-    apply_archive_metadata(source, destination)
-    restore_selinux_context(destination)
-
-
-def preserve_restored_ancestor_metadata(
-    source_root: pathlib.Path,
-    source: pathlib.Path,
-    destination: pathlib.Path,
-) -> None:
-    """Recreate restored absolute-path ancestors under a non-root target tree."""
-
-    relative_source = source.relative_to(source_root)
-    destination_root = destination
-    for _ in relative_source.parts:
-        destination_root = destination_root.parent
-
-    ancestor = pathlib.Path()
-    for part in relative_source.parts[:-1]:
-        ancestor /= part
-        source_ancestor = source_root / ancestor
-        destination_ancestor = destination_root / ancestor
-        destination_ancestor.mkdir(parents=True, exist_ok=True)
-        apply_archive_metadata(source_ancestor, destination_ancestor)
-
-
-def apply_archive_metadata(source: pathlib.Path, destination: pathlib.Path) -> None:
-    """Apply metadata from restic-restored paths after Python copy operations."""
-
-    shutil.copystat(source, destination, follow_symlinks=False)
-    source_stat = source.lstat()
-    os.chown(destination, source_stat.st_uid, source_stat.st_gid, follow_symlinks=False)
-
-    if not source.is_dir() or source.is_symlink():
-        return
-
-    for source_child in source.rglob("*"):
-        destination_child = destination / source_child.relative_to(source)
-        if not destination_child.exists() and not destination_child.is_symlink():
-            continue
-        shutil.copystat(source_child, destination_child, follow_symlinks=False)
-        child_stat = source_child.lstat()
-        os.chown(
-            destination_child,
-            child_stat.st_uid,
-            child_stat.st_gid,
-            follow_symlinks=False,
+) -> bool:
+    with _destination_parent(destination, source, source_root) as parent_fd:
+        restored = _merge_entry(
+            source, parent_fd, destination.name, destination, overwrite
         )
+    return restored
 
 
 def restore_selinux_context(path: pathlib.Path) -> None:
@@ -1001,10 +1122,9 @@ def restore_selinux_context(path: pathlib.Path) -> None:
         selinux.matchpathcon(os.path.abspath(path), 0)
     except FileNotFoundError:
         return
-    flags = (
-        selinux.SELINUX_RESTORECON_RECURSE | selinux.SELINUX_RESTORECON_IGNORE_NOENTRY
+    selinux.selinux_restorecon(
+        os.path.abspath(path), selinux.SELINUX_RESTORECON_IGNORE_NOENTRY
     )
-    selinux.selinux_restorecon(os.path.abspath(path), flags)
 
 
 # ---------------------------------------------------------------------------
@@ -1318,7 +1438,7 @@ def main(argv: list[str] | None = None) -> int:
             target_dir = (
                 pathlib.Path.cwd()
                 if args.target is None
-                else pathlib.Path(args.target).resolve(strict=False)
+                else pathlib.Path(os.path.abspath(args.target))
             )
             if args.as_of and args.until:
                 raise GrayhavenBackupctlError(
