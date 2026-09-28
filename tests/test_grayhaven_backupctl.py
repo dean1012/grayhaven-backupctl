@@ -9,6 +9,7 @@ import json
 import os
 import pathlib
 import runpy
+import stat
 import subprocess
 import sys
 import tempfile
@@ -893,6 +894,294 @@ class GrayhavenBackupctlTests(unittest.TestCase):
 
             self.assertTrue(destination.is_symlink())
             self.assertEqual(os.readlink(destination), "target.txt")
+
+    def test_restore_removes_temporary_entry_if_replace_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            for source_type in ("file", "symlink"):
+                with self.subTest(source_type=source_type):
+                    source = root / f"source-{source_type}"
+                    destination = root / f"destination-{source_type}"
+                    if source_type == "file":
+                        source.write_text("restored", encoding="utf-8")
+                    else:
+                        source.symlink_to("target.txt")
+
+                    with mock.patch.object(
+                        backupctl_module.os,
+                        "replace",
+                        side_effect=OSError("simulated replacement failure"),
+                    ):
+                        with self.assertRaisesRegex(
+                            OSError, "simulated replacement failure"
+                        ):
+                            backupctl_module.copy_restored_path(
+                                source, destination, overwrite=True
+                            )
+
+                    self.assertFalse(os.path.lexists(destination))
+                    self.assertEqual(list(root.glob(".backupctl-*")), [])
+
+    def test_restore_preserves_archived_fifo(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            source = root / "source-fifo"
+            destination = root / "destination-fifo"
+            os.mkfifo(source, 0o640)
+
+            with mock.patch.object(
+                backupctl_module.selinux, "is_selinux_enabled", return_value=0
+            ):
+                backupctl_module.copy_restored_path(source, destination, overwrite=True)
+
+            self.assertTrue(stat.S_ISFIFO(destination.lstat().st_mode))
+            self.assertEqual(
+                stat.S_IMODE(destination.lstat().st_mode),
+                stat.S_IMODE(source.lstat().st_mode),
+            )
+
+    def test_restore_removes_temporary_fifo_if_replace_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            source = root / "source-fifo"
+            destination = root / "destination-fifo"
+            os.mkfifo(source)
+
+            with mock.patch.object(
+                backupctl_module.os,
+                "replace",
+                side_effect=OSError("simulated replacement failure"),
+            ):
+                with self.assertRaisesRegex(OSError, "simulated replacement failure"):
+                    backupctl_module.copy_restored_path(
+                        source, destination, overwrite=True
+                    )
+
+            self.assertFalse(os.path.lexists(destination))
+            self.assertEqual(list(root.glob(".backupctl-*")), [])
+
+    def test_restore_recreates_device_nodes_from_archived_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            device_number = os.makedev(1, 3)
+            for node_type in (stat.S_IFCHR, stat.S_IFBLK):
+                with self.subTest(node_type=node_type):
+                    source = mock.Mock()
+                    source.lstat.return_value = mock.Mock(
+                        st_mode=node_type | 0o620,
+                        st_uid=os.getuid(),
+                        st_gid=os.getgid(),
+                        st_rdev=device_number,
+                        st_nlink=1,
+                        st_dev=1,
+                        st_ino=node_type,
+                        st_atime_ns=1_000_000_000,
+                        st_mtime_ns=1_000_000_000,
+                    )
+                    destination = root / f"device-{node_type}"
+
+                    def create_test_node(
+                        name, mode, device, *, dir_fd, expected_type=node_type
+                    ):
+                        self.assertEqual(stat.S_IFMT(mode), expected_type)
+                        self.assertEqual(device, device_number)
+                        os.mkfifo(name, dir_fd=dir_fd)
+
+                    with (
+                        mock.patch.object(
+                            backupctl_module.os,
+                            "mknod",
+                            side_effect=create_test_node,
+                        ) as mknod,
+                        mock.patch.object(
+                            backupctl_module.selinux,
+                            "is_selinux_enabled",
+                            return_value=0,
+                        ),
+                        mock.patch.object(backupctl_module, "_copy_xattrs"),
+                    ):
+                        parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+                        try:
+                            backupctl_module._merge_entry(
+                                source,
+                                parent_fd,
+                                destination.name,
+                                destination,
+                                True,
+                                {},
+                            )
+                        finally:
+                            os.close(parent_fd)
+
+                    mknod.assert_called_once()
+                    self.assertTrue(stat.S_ISFIFO(destination.lstat().st_mode))
+
+    def test_restore_preserves_file_and_directory_extended_attributes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            source = root / "source"
+            destination = root / "destination"
+            source.mkdir()
+            source_file = source / "file.txt"
+            source_file.write_text("restored", encoding="utf-8")
+            os.setxattr(source, "user.backupctl-test", b"directory")
+            os.setxattr(source_file, "user.backupctl-test", b"file")
+
+            with mock.patch.object(
+                backupctl_module.selinux, "is_selinux_enabled", return_value=0
+            ):
+                backupctl_module.copy_restored_path(source, destination, overwrite=True)
+
+            self.assertEqual(
+                os.getxattr(destination, "user.backupctl-test"), b"directory"
+            )
+            self.assertEqual(
+                os.getxattr(destination / "file.txt", "user.backupctl-test"),
+                b"file",
+            )
+
+    def test_restore_preserves_regular_and_fifo_hard_links(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            source = root / "source"
+            destination = root / "destination"
+            source.mkdir()
+            (source / "file-a").write_text("restored", encoding="utf-8")
+            os.link(source / "file-a", source / "file-b")
+            os.mkfifo(source / "fifo-a")
+            os.link(source / "fifo-a", source / "fifo-b")
+
+            with mock.patch.object(
+                backupctl_module.selinux, "is_selinux_enabled", return_value=0
+            ):
+                backupctl_module.copy_restored_path(source, destination, overwrite=True)
+
+            for kind in ("file", "fifo"):
+                first = (destination / f"{kind}-a").lstat()
+                second = (destination / f"{kind}-b").lstat()
+                self.assertEqual(
+                    (first.st_dev, first.st_ino), (second.st_dev, second.st_ino)
+                )
+                self.assertEqual(first.st_nlink, 2)
+
+    def test_restore_rejects_changed_hard_link_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            previous = root / "previous"
+            previous.write_text("restored", encoding="utf-8")
+            parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with self.assertRaisesRegex(
+                    backupctl_module.GrayhavenBackupctlError,
+                    "Previously restored hard link changed",
+                ):
+                    backupctl_module._link_restored_entry(
+                        previous, previous, parent_fd, "next", (0, 0)
+                    )
+            finally:
+                os.close(parent_fd)
+            self.assertEqual(list(root.glob(".backupctl-*")), [])
+
+    def test_restore_rejects_hard_link_source_changed_during_link(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            previous = root / "previous"
+            previous.write_text("restored", encoding="utf-8")
+            replacement = root / "replacement"
+            replacement.write_text("replacement", encoding="utf-8")
+            original_stat = previous.stat()
+            real_link = os.link
+
+            def swap_before_link(source, destination, **kwargs):
+                os.replace(replacement, previous)
+                real_link(source, destination, **kwargs)
+
+            parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with mock.patch.object(
+                    backupctl_module.os, "link", side_effect=swap_before_link
+                ):
+                    with self.assertRaisesRegex(
+                        backupctl_module.GrayhavenBackupctlError,
+                        "Previously restored hard link changed",
+                    ):
+                        backupctl_module._link_restored_entry(
+                            previous,
+                            previous,
+                            parent_fd,
+                            "next",
+                            (original_stat.st_dev, original_stat.st_ino),
+                        )
+            finally:
+                os.close(parent_fd)
+            self.assertFalse((root / "next").exists())
+            self.assertEqual(list(root.glob(".backupctl-*")), [])
+
+    def test_restore_rejects_hard_link_changed_during_installation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            previous = root / "previous"
+            previous.write_text("restored", encoding="utf-8")
+            replacement = root / "replacement"
+            replacement.write_text("replacement", encoding="utf-8")
+            source_stat = previous.stat()
+            real_replace = os.replace
+
+            def swap_temporary_entry(source, destination, **kwargs):
+                real_replace(
+                    replacement,
+                    source,
+                    dst_dir_fd=kwargs["src_dir_fd"],
+                )
+                real_replace(source, destination, **kwargs)
+
+            parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with mock.patch.object(
+                    backupctl_module.os, "replace", side_effect=swap_temporary_entry
+                ):
+                    with self.assertRaisesRegex(
+                        backupctl_module.GrayhavenBackupctlError,
+                        "Restored hard link changed during installation",
+                    ):
+                        backupctl_module._link_restored_entry(
+                            previous,
+                            previous,
+                            parent_fd,
+                            "next",
+                            (source_stat.st_dev, source_stat.st_ino),
+                        )
+            finally:
+                os.close(parent_fd)
+            self.assertFalse((root / "next").exists())
+            self.assertEqual(list(root.glob(".backupctl-*")), [])
+
+    def test_restore_removes_temporary_hard_link_if_replace_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            previous = root / "previous"
+            previous.write_text("restored", encoding="utf-8")
+            source_stat = previous.stat()
+            parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with mock.patch.object(
+                    backupctl_module.os,
+                    "replace",
+                    side_effect=OSError("simulated replacement failure"),
+                ):
+                    with self.assertRaisesRegex(
+                        OSError, "simulated replacement failure"
+                    ):
+                        backupctl_module._link_restored_entry(
+                            previous,
+                            previous,
+                            parent_fd,
+                            "next",
+                            (source_stat.st_dev, source_stat.st_ino),
+                        )
+            finally:
+                os.close(parent_fd)
+            self.assertEqual(list(root.glob(".backupctl-*")), [])
 
     def test_restore_rejects_destination_symlink_ancestor(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

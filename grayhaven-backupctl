@@ -929,7 +929,18 @@ def _archive_metadata(source: pathlib.Path, destination_fd: int) -> None:
     source_stat = source.lstat()
     os.fchown(destination_fd, source_stat.st_uid, source_stat.st_gid)
     os.fchmod(destination_fd, stat.S_IMODE(source_stat.st_mode))
+    _copy_xattrs(source, destination_fd)
     os.utime(destination_fd, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
+
+
+def _copy_xattrs(
+    source: pathlib.Path, destination: str | int, *, follow_symlinks: bool = True
+) -> None:
+    """Carry Restic-restored extended attributes onto a new destination entry."""
+
+    for name in os.listxattr(source, follow_symlinks=False):
+        value = os.getxattr(source, name, follow_symlinks=False)
+        os.setxattr(destination, name, value, follow_symlinks=follow_symlinks)
 
 
 @contextlib.contextmanager
@@ -937,6 +948,8 @@ def _destination_parent(
     destination: pathlib.Path,
     source: pathlib.Path,
     source_root: pathlib.Path | None,
+    *,
+    create: bool = True,
 ) -> Iterator[int]:
     """Walk and create destination ancestors without following symlinks."""
 
@@ -963,11 +976,12 @@ def _destination_parent(
         for part in absolute.parts[1:-1]:
             current_path /= part
             created = False
-            try:
-                os.mkdir(part, mode=0o700, dir_fd=current_fd)
-                created = True
-            except FileExistsError:
-                pass
+            if create:
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=current_fd)
+                    created = True
+                except FileExistsError:
+                    pass
             try:
                 next_fd = os.open(part, flags, dir_fd=current_fd)
             except OSError as exc:
@@ -1019,6 +1033,7 @@ def _copy_regular_file(
                 shutil.copyfileobj(source_file, target_file)
             os.fchown(temporary_fd, source_stat.st_uid, source_stat.st_gid)
             os.fchmod(temporary_fd, stat.S_IMODE(source_stat.st_mode))
+            _copy_xattrs(source, temporary_fd)
             os.utime(
                 temporary_fd,
                 ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
@@ -1028,7 +1043,7 @@ def _copy_regular_file(
         os.replace(temporary_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
     finally:
         os.close(source_fd)
-        if _existing_entry(parent_fd, temporary_name) is not None:  # pragma: no cover
+        if _existing_entry(parent_fd, temporary_name) is not None:
             os.unlink(temporary_name, dir_fd=parent_fd)
 
 
@@ -1045,6 +1060,11 @@ def _copy_symlink(
             dir_fd=parent_fd,
             follow_symlinks=False,
         )
+        _copy_xattrs(
+            source,
+            f"/proc/self/fd/{parent_fd}/{temporary_name}",
+            follow_symlinks=False,
+        )
         os.utime(
             temporary_name,
             ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
@@ -1053,7 +1073,85 @@ def _copy_symlink(
         )
         os.replace(temporary_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
     finally:
-        if _existing_entry(parent_fd, temporary_name) is not None:  # pragma: no cover
+        if _existing_entry(parent_fd, temporary_name) is not None:
+            os.unlink(temporary_name, dir_fd=parent_fd)
+
+
+def _copy_special_file(
+    source: pathlib.Path, parent_fd: int, name: str, source_stat: os.stat_result
+) -> None:
+    """Recreate an archived FIFO or device node without opening its contents."""
+
+    temporary_name = f".backupctl-{secrets.token_hex(16)}"
+    node_type = stat.S_IFMT(source_stat.st_mode)
+    os.mknod(temporary_name, node_type | 0o600, source_stat.st_rdev, dir_fd=parent_fd)
+    try:
+        os.chown(
+            temporary_name,
+            source_stat.st_uid,
+            source_stat.st_gid,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        os.chmod(
+            temporary_name,
+            stat.S_IMODE(source_stat.st_mode),
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        _copy_xattrs(source, f"/proc/self/fd/{parent_fd}/{temporary_name}")
+        os.utime(
+            temporary_name,
+            ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        os.replace(temporary_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+    finally:
+        if _existing_entry(parent_fd, temporary_name) is not None:
+            os.unlink(temporary_name, dir_fd=parent_fd)
+
+
+def _link_restored_entry(
+    previous: pathlib.Path,
+    source: pathlib.Path,
+    parent_fd: int,
+    name: str,
+    expected_inode: tuple[int, int],
+) -> None:
+    """Recreate a hard link to an entry already copied from the same archive."""
+
+    temporary_name = f".backupctl-{secrets.token_hex(16)}"
+    with _destination_parent(previous, source, None, create=False) as previous_fd:
+        previous_stat = os.stat(
+            previous.name, dir_fd=previous_fd, follow_symlinks=False
+        )
+        if (previous_stat.st_dev, previous_stat.st_ino) != expected_inode:
+            raise GrayhavenBackupctlError(
+                f"Previously restored hard link changed: {previous}"
+            )
+        os.link(
+            previous.name,
+            temporary_name,
+            src_dir_fd=previous_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    try:
+        linked_stat = os.stat(temporary_name, dir_fd=parent_fd, follow_symlinks=False)
+        if (linked_stat.st_dev, linked_stat.st_ino) != expected_inode:
+            raise GrayhavenBackupctlError(
+                f"Previously restored hard link changed: {previous}"
+            )
+        os.replace(temporary_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        installed_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (installed_stat.st_dev, installed_stat.st_ino) != expected_inode:
+            os.unlink(name, dir_fd=parent_fd)
+            raise GrayhavenBackupctlError(
+                f"Restored hard link changed during installation: {name}"
+            )
+    finally:
+        if _existing_entry(parent_fd, temporary_name) is not None:
             os.unlink(temporary_name, dir_fd=parent_fd)
 
 
@@ -1063,6 +1161,7 @@ def _merge_entry(
     name: str,
     destination: pathlib.Path,
     force: bool,
+    hardlinks: dict[tuple[int, int], tuple[pathlib.Path, tuple[int, int]]],
 ) -> bool:
     source_stat = source.lstat()
     existing = _existing_entry(parent_fd, name)
@@ -1085,17 +1184,41 @@ def _merge_entry(
         try:
             for child in sorted(source.iterdir()):
                 _merge_entry(
-                    child, child_fd, child.name, destination / child.name, force
+                    child,
+                    child_fd,
+                    child.name,
+                    destination / child.name,
+                    force,
+                    hardlinks,
                 )
             _archive_metadata(source, child_fd)
         finally:
             os.close(child_fd)
+    elif (
+        source_stat.st_nlink > 1
+        and (source_stat.st_dev, source_stat.st_ino) in hardlinks
+    ):
+        previous, expected_inode = hardlinks[(source_stat.st_dev, source_stat.st_ino)]
+        _link_restored_entry(previous, source, parent_fd, name, expected_inode)
     elif stat.S_ISREG(source_stat.st_mode):
         _copy_regular_file(source, parent_fd, name, source_stat)
     elif stat.S_ISLNK(source_stat.st_mode):
         _copy_symlink(source, parent_fd, name, source_stat)
+    elif any(
+        check(source_stat.st_mode)
+        for check in (stat.S_ISFIFO, stat.S_ISCHR, stat.S_ISBLK)
+    ):
+        _copy_special_file(source, parent_fd, name, source_stat)
     else:  # pragma: no cover
         raise GrayhavenBackupctlError(f"Unsupported archived file type: {source}")
+    if not source_directory and source_stat.st_nlink > 1:
+        key = (source_stat.st_dev, source_stat.st_ino)
+        if key not in hardlinks:
+            copied_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            hardlinks[key] = (
+                destination,
+                (copied_stat.st_dev, copied_stat.st_ino),
+            )
     restore_selinux_context(destination)
     return True
 
@@ -1108,7 +1231,7 @@ def copy_restored_path(
 ) -> bool:
     with _destination_parent(destination, source, source_root) as parent_fd:
         restored = _merge_entry(
-            source, parent_fd, destination.name, destination, overwrite
+            source, parent_fd, destination.name, destination, overwrite, {}
         )
     return restored
 

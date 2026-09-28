@@ -193,7 +193,7 @@ sudo grayhaven-backupctl restore abc12345 --path /home/example/report.txt
 ```
 
 Existing directories are merged with restored entries. Files and symlinks not
-in the backup remain in place. For each conflicting file or symlink, answer
+in the backup remain in place. For each conflicting entry, answer
 `y` to overwrite it or `n` to leave it unchanged. The same rule applies to
 in-place and target-directory restores. `--force` overwrites conflicts without
 prompting:
@@ -225,10 +225,12 @@ Each requested path is restored from the newest matching backup that contains
 that path. If one path exists only in an older backup, only that path falls back
 to the older snapshot.
 
-In-place restore merges directories and prompts for each conflicting file or
-symlink unless `--force` is specified. Archived symlinks are restored as links;
-they are not followed. A destination path is rejected if any of its parent
-directories is a symlink.
+In-place restore merges directories and prompts for each conflicting entry
+unless `--force` is specified. Archived symlinks are restored as links; they
+are not followed. Archived FIFOs and device nodes are restored as filesystem
+entries without reading their contents. Extended attributes and hard-link
+relationships within a restored directory are preserved. A destination path is
+rejected if any of its parent directories is a symlink.
 
 [Back to top](#operations)
 
