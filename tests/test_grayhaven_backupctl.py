@@ -67,6 +67,9 @@ class GrayhavenBackupctlTests(unittest.TestCase):
     """Coverage for grayhaven-backupctl commands and core backup behavior."""
 
     def setUp(self) -> None:
+        environment = mock.patch.dict(os.environ, {}, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
         self.config = backupctl_module.BackupConfig(
             local_repository="/var/backups/restic",
             remote_enabled=True,
@@ -165,10 +168,13 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         repos = service.repositories("all")
 
         self.assertEqual([repo.name for repo in repos], ["local", "remote"])
-        self.assertEqual(repos[1].env["GOOGLE_PROJECT_ID"], "grayhaven")
-        self.assertEqual(
-            repos[1].env["GOOGLE_APPLICATION_CREDENTIALS"],
-            "/etc/grayhaven/backup/gcs-credentials.json",
+        self.assert_environment_equal(
+            repos[1].env,
+            {
+                "RESTIC_CACHE_DIR": self.config.restic_cache_dir,
+                "GOOGLE_PROJECT_ID": self.config.gcs_project_id,
+                "GOOGLE_APPLICATION_CREDENTIALS": self.config.gcs_credentials_file,
+            },
         )
         self.assertTrue(service.remote_configured())
 
@@ -182,17 +188,98 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         self.assertEqual(service.repositories("remote"), [])
         self.assertFalse(service.remote_configured())
 
+    def assert_environment_equal(
+        self, actual: dict[str, str], expected: dict[str, str | None]
+    ) -> None:
+        """Compare environments with key-only failure diagnostics."""
+        self.assertEqual(set(actual), set(expected))
+        for key in expected:
+            self.assertTrue(
+                actual[key] == expected[key], f"Environment value mismatch for {key}"
+            )
+
     def test_remote_repository_env_omits_absent_gcs_values(self) -> None:
         config = dataclass_replace(
             self.config, gcs_project_id=None, gcs_credentials_file=None
         )
         repo = backupctl_module.Repository("remote", "gs:host-restic:/", config)
 
-        env = repo.env
+        self.assert_environment_equal(
+            repo.env, {"RESTIC_CACHE_DIR": config.restic_cache_dir}
+        )
 
-        self.assertNotIn("GOOGLE_PROJECT_ID", env)
-        self.assertNotIn("GOOGLE_APPLICATION_CREDENTIALS", env)
-        self.assertEqual(env["RESTIC_CACHE_DIR"], "/var/cache/restic")
+    def test_repository_env_inherits_and_overrides_each_gcs_value(self) -> None:
+        gcs_keys = ("GOOGLE_PROJECT_ID", "GOOGLE_APPLICATION_CREDENTIALS")
+        inherited = {
+            "RESTIC_CACHE_DIR": "dummy-inherited-cache",
+            "UNRELATED_SECRET": "dummy-unrelated-secret",
+            "GOOGLE_PROJECT_ID": "dummy-inherited-project",
+            "GOOGLE_APPLICATION_CREDENTIALS": "/tmp/dummy-inherited.json",
+        }
+        for name in ("local", "remote"):
+            for inherited_keys in ((), gcs_keys[:1], gcs_keys[1:], gcs_keys):
+                for project in (None, "", "dummy-configured-project"):
+                    for credentials in (None, "", "/tmp/dummy-configured.json"):
+                        # Subtest labels contain no configuration or environment values.
+                        with self.subTest(
+                            repository=name,
+                            inherited_keys=inherited_keys,
+                            project_present=bool(project),
+                            credentials_present=bool(credentials),
+                            project_is_none=project is None,
+                            credentials_is_none=credentials is None,
+                        ):
+                            source = {
+                                key: value
+                                for key, value in inherited.items()
+                                if key in inherited_keys or key not in gcs_keys
+                            }
+                            config = dataclass_replace(
+                                self.config,
+                                gcs_project_id=project,
+                                gcs_credentials_file=credentials,
+                            )
+                            expected = source.copy()
+                            expected["RESTIC_CACHE_DIR"] = config.restic_cache_dir
+                            if name == "remote":
+                                if project:
+                                    expected[gcs_keys[0]] = project
+                                if credentials:
+                                    expected[gcs_keys[1]] = credentials
+                            with mock.patch.dict(os.environ, source, clear=True):
+                                repo = backupctl_module.Repository(
+                                    name, "dummy-repository", config
+                                )
+                                self.assert_environment_equal(repo.env, expected)
+                                self.assert_environment_equal(dict(os.environ), source)
+
+    def test_environment_failure_diagnostics_omit_values(self) -> None:
+        dummy_value = "DUMMY_DIAGNOSTIC_SECRET"
+        expected_value = "DUMMY_EXPECTED_SECRET"
+        cases = (
+            ({"UNEXPECTED_KEY": dummy_value}, {}),
+            ({}, {"MISSING_KEY": expected_value}),
+            ({"MISMATCH_KEY": dummy_value}, {"MISMATCH_KEY": expected_value}),
+        )
+        for actual, expected in cases:
+            with self.subTest(keys=sorted(set(actual) | set(expected))):
+
+                def fail_comparison(actual=actual, expected=expected):
+                    self.assert_environment_equal(actual, expected)
+
+                output = io.StringIO()
+                result = unittest.TextTestRunner(stream=output).run(
+                    unittest.FunctionTestCase(fail_comparison)
+                )
+                self.assertEqual(len(result.failures), 1)
+                self.assertEqual(len(result.errors), 0)
+                diagnostic = output.getvalue()
+                for key in set(actual) | set(expected):
+                    self.assertTrue(key in diagnostic, "Missing environment key")
+                for value in (dummy_value, expected_value):
+                    self.assertFalse(
+                        value in diagnostic, "Environment value leaked in diagnostic"
+                    )
 
     def test_command_runner_executes_commands(self) -> None:
         runner = backupctl_module.CommandRunner()
@@ -1714,6 +1801,19 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         self.assertEqual(backupctl_module.first_matching_path("/", ["/"]), "/")
         self.assertTrue(backupctl_module.has_glob("/home/*"))
 
+    def test_first_matching_exact_path_skips_nonmatching_entries(self) -> None:
+        self.assertEqual(
+            backupctl_module.first_matching_path(
+                "/dummy/requested/", ["/dummy/other", "/dummy/requested"]
+            ),
+            "/dummy/requested",
+        )
+        self.assertIsNone(
+            backupctl_module.first_matching_path(
+                "/dummy/requested", ["/dummy/other", "/dummy/another"]
+            )
+        )
+
     def test_read_requested_paths_reports_file_and_empty_errors(self) -> None:
         missing_file_args = mock.Mock(path=[], path_file="/missing/path-list")
         with self.assertRaisesRegex(
@@ -1808,6 +1908,47 @@ class GrayhavenBackupctlTests(unittest.TestCase):
             "complete -F _grayhaven_backupctl grayhaven-backupctl", stdout.getvalue()
         )
         config_loader.assert_not_called()
+
+    def test_main_unsupported_completion_shell_returns_without_output(self) -> None:
+        # Argparse rejects this shell today; exercise the defensive dispatch path.
+        parser = mock.Mock()
+        parser.parse_args.return_value = mock.Mock(command="completion")
+        parser.parse_args.return_value.shell = "zsh"
+        with (
+            mock.patch.object(backupctl_module, "build_parser", return_value=parser),
+            mock.patch.object(backupctl_module, "bash_completion_script") as completion,
+            mock.patch.object(
+                backupctl_module.BackupConfig, "from_backup_script"
+            ) as config_loader,
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            status = backupctl_module.main(["completion", "zsh"])
+
+        self.assertEqual(status, 0)
+        self.assertEqual(stdout.getvalue(), "")
+        completion.assert_not_called()
+        config_loader.assert_not_called()
+
+    def test_main_unmatched_command_returns_without_service_operations(self) -> None:
+        # A mocked parser result covers fallthrough without adding a CLI command.
+        parser = mock.Mock()
+        parser.parse_args.return_value = mock.Mock(command="unknown")
+        with (
+            mock.patch.object(backupctl_module, "build_parser", return_value=parser),
+            mock.patch.object(
+                backupctl_module.BackupConfig,
+                "from_backup_script",
+                return_value=self.config,
+            ),
+            mock.patch.object(backupctl_module, "BackupService") as service,
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            status = backupctl_module.main(["unknown"])
+
+        self.assertEqual(status, 0)
+        self.assertEqual(stdout.getvalue(), "")
+        service.assert_called_once_with(self.config)
+        self.assertEqual(service.return_value.mock_calls, [])
 
     def test_main_module_entrypoint_prints_help(self) -> None:
         with (
