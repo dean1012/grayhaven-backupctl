@@ -67,6 +67,11 @@ minor, set `BUILD` to `0`. For each later retained work commit, increment
 builds in commit order so there are no gaps or duplicates. Use the applicable
 non-closing issue reference in related commits, such as `Refs #<issue-number>`.
 
+Every bump to `VERSION` requires a matching signed annotated
+`v<semantic-version>` tag, including documentation-only and test-only changes.
+Create and push the tag before considering the work complete, even when no
+deployment is planned.
+
 After `main` is accepted and final, create one signed annotated tag targeting
 the accepted full `main` commit, verify its signature and target, and push only
 that tag:
