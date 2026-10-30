@@ -19,7 +19,7 @@ servers.
 ## Scope
 
 `grayhaven-backupctl` wraps the restic repositories configured by
-[grayhaven-config-ansible](https://github.com/dean1012/grayhaven-config-ansible)
+[grayhaven-config-ansible](https://github.com/grayhavensystemsllc/grayhaven-config-ansible)
 for Grayhaven Systems LLC managed servers. It gives operators one command for
 common backup review, search, and restore tasks while leaving restic as the
 authoritative backup engine.
@@ -58,7 +58,7 @@ For the canonical contributor version and release-tag procedure, see
 ## Managed Environment
 
 `grayhaven-backupctl` is installed and maintained by
-[grayhaven-config-ansible](https://github.com/dean1012/grayhaven-config-ansible)
+[grayhaven-config-ansible](https://github.com/grayhavensystemsllc/grayhaven-config-ansible)
 on Grayhaven Systems LLC managed servers. It expects the host layout, restic
 configuration, backup runner, system packages, and optional remote backup
 credentials managed by that repository.
