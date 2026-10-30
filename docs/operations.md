@@ -299,7 +299,7 @@ source <(grayhaven-backupctl completion bash)
 ```
 
 System-wide completion installation is handled by
-[grayhaven-config-ansible](https://github.com/dean1012/grayhaven-config-ansible).
+[grayhaven-config-ansible](https://github.com/grayhavensystemsllc/grayhaven-config-ansible).
 
 [Back to top](#operations)
 

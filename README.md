@@ -1,8 +1,8 @@
 # Grayhaven Systems LLC Backup (grayhaven-backupctl)
 
-[![CI](https://github.com/dean1012/grayhaven-backupctl/actions/workflows/ci.yml/badge.svg)](https://github.com/dean1012/grayhaven-backupctl/actions/workflows/ci.yml)
-[![Unit Tests](https://github.com/dean1012/grayhaven-backupctl/actions/workflows/unit-tests.yml/badge.svg)](https://github.com/dean1012/grayhaven-backupctl/actions/workflows/unit-tests.yml)
-[![codecov](https://codecov.io/gh/dean1012/grayhaven-backupctl/graph/badge.svg)](https://codecov.io/gh/dean1012/grayhaven-backupctl)
+[![CI](https://github.com/grayhavensystemsllc/grayhaven-backupctl/actions/workflows/ci.yml/badge.svg)](https://github.com/grayhavensystemsllc/grayhaven-backupctl/actions/workflows/ci.yml)
+[![Unit Tests](https://github.com/grayhavensystemsllc/grayhaven-backupctl/actions/workflows/unit-tests.yml/badge.svg)](https://github.com/grayhavensystemsllc/grayhaven-backupctl/actions/workflows/unit-tests.yml)
+[![codecov](https://codecov.io/gh/grayhavensystemsllc/grayhaven-backupctl/graph/badge.svg)](https://codecov.io/gh/grayhavensystemsllc/grayhaven-backupctl)
 
 Operator-friendly backup and restore utility for Grayhaven Systems LLC managed
 servers.
@@ -19,7 +19,7 @@ servers.
 ## Scope
 
 `grayhaven-backupctl` wraps the restic repositories configured by
-[grayhaven-config-ansible](https://github.com/dean1012/grayhaven-config-ansible)
+[grayhaven-config-ansible](https://github.com/grayhavensystemsllc/grayhaven-config-ansible)
 for Grayhaven Systems LLC managed servers. It gives operators one command for
 common backup review, search, and restore tasks while leaving restic as the
 authoritative backup engine.
@@ -58,7 +58,7 @@ For the canonical contributor version and release-tag procedure, see
 ## Managed Environment
 
 `grayhaven-backupctl` is installed and maintained by
-[grayhaven-config-ansible](https://github.com/dean1012/grayhaven-config-ansible)
+[grayhaven-config-ansible](https://github.com/grayhavensystemsllc/grayhaven-config-ansible)
 on Grayhaven Systems LLC managed servers. It expects the host layout, restic
 configuration, backup runner, system packages, and optional remote backup
 credentials managed by that repository.
