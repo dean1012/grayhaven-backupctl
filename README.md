@@ -1,8 +1,8 @@
 # Grayhaven Systems LLC Backup (grayhaven-backupctl)
 
-[![CI](https://github.com/dean1012/grayhaven-backupctl/actions/workflows/ci.yml/badge.svg)](https://github.com/dean1012/grayhaven-backupctl/actions/workflows/ci.yml)
-[![Unit Tests](https://github.com/dean1012/grayhaven-backupctl/actions/workflows/unit-tests.yml/badge.svg)](https://github.com/dean1012/grayhaven-backupctl/actions/workflows/unit-tests.yml)
-[![codecov](https://codecov.io/gh/dean1012/grayhaven-backupctl/graph/badge.svg)](https://codecov.io/gh/dean1012/grayhaven-backupctl)
+[![CI](https://github.com/grayhavensystemsllc/grayhaven-backupctl/actions/workflows/ci.yml/badge.svg)](https://github.com/grayhavensystemsllc/grayhaven-backupctl/actions/workflows/ci.yml)
+[![Unit Tests](https://github.com/grayhavensystemsllc/grayhaven-backupctl/actions/workflows/unit-tests.yml/badge.svg)](https://github.com/grayhavensystemsllc/grayhaven-backupctl/actions/workflows/unit-tests.yml)
+[![codecov](https://codecov.io/gh/grayhavensystemsllc/grayhaven-backupctl/graph/badge.svg)](https://codecov.io/gh/grayhavensystemsllc/grayhaven-backupctl)
 
 Operator-friendly backup and restore utility for Grayhaven Systems LLC managed
 servers.
